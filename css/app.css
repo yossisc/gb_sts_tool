@@ -375,6 +375,38 @@ select.text {
   width: 100%;
 }
 
+/* Consumer groups (list): 70% Group / 30% size; wrap long group names. */
+.kafka-consumer-groups-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.kafka-consumer-groups-table th:nth-child(1),
+.kafka-consumer-groups-table td:nth-child(1) {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.kafka-consumer-groups-table:has(th:nth-child(2)) th:nth-child(1),
+.kafka-consumer-groups-table:has(th:nth-child(2)) td:nth-child(1) {
+  width: 70%;
+}
+
+.kafka-consumer-groups-table:has(th:nth-child(2)) th:nth-child(2),
+.kafka-consumer-groups-table:has(th:nth-child(2)) td:nth-child(2) {
+  width: 30%;
+  white-space: normal;
+  vertical-align: top;
+}
+
+.kafka-consumer-groups-table td:nth-child(1) .cell-link {
+  white-space: normal;
+  word-break: break-word;
+  text-align: left;
+}
+
 .kafka-groups-right {
   display: flex;
   flex-direction: column;

@@ -400,6 +400,7 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
         const hasSizeCol = hdr && hdr.length >= 2;
         inner += renderTable(j.table, {
           theadFirstRow: true,
+          tableClass: "kafka-consumer-groups-table",
           pickColumn: { index: 0, variant: "group" },
           stringSortableColumnIndexes: hasSizeCol ? [] : [0],
           sortableColumnIndexes: hasSizeCol ? [1] : [],
@@ -409,7 +410,10 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
       }
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
-    inner += kafkaPreWithWrapFooter(blobOut, { wrapChecked: panelId === "group_state" });
+    inner += kafkaPreWithWrapFooter(blobOut, {
+      wrapChecked:
+        panelId === "group_state" || panelId === "group_members" || panelId === "group_members_verbose",
+    });
     inner += `<p class='hint'>exit ${esc(String(j.returncode))}</p>`;
     elOut.innerHTML = inner;
     bindCopyButtons(elOut);
@@ -503,6 +507,11 @@ function toggleAwsProfileRow() {
   const cloud = document.getElementById("cloud-select")?.value || "aws";
   const row = document.getElementById("aws-profile-row");
   if (row) row.style.display = cloud === "azure" ? "none" : "";
+}
+
+/** Home “List clusters”: only show names ending with ``-core`` (e.g. ``dev-mt-eks-core``). */
+function filterCoreClusters(clusters) {
+  return (clusters || []).filter((c) => String(c?.name || "").endsWith("-core"));
 }
 
 function buildConnectPayload() {
@@ -645,7 +654,7 @@ function renderHome() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cloud, region, aws_profile }),
       });
-      clustersList = j.clusters || [];
+      clustersList = filterCoreClusters(j.clusters || []);
       cSel.innerHTML = '<option value="">— Select a cluster —</option>';
       clustersList.forEach((c, i) => {
         const o = document.createElement("option");
@@ -656,10 +665,12 @@ function renderHome() {
         cSel.appendChild(o);
       });
       if (!clustersList.length) {
-        cSel.innerHTML = '<option value="">(no clusters in this region / filter)</option>';
+        cSel.innerHTML = '<option value="">(no *-core clusters in this region)</option>';
       }
       if (listStatus) {
-        listStatus.textContent = clustersList.length ? `Listed ${clustersList.length} cluster(s).` : "No clusters returned.";
+        listStatus.textContent = clustersList.length
+          ? `Listed ${clustersList.length} *-core cluster(s) (others omitted).`
+          : "No *-core clusters in this region.";
         listStatus.className = clustersList.length
           ? "list-clusters-status list-clusters-status--ok"
           : "list-clusters-status muted";

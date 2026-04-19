@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.7",
+    "app_version": "1.0.12",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",
@@ -37,6 +37,7 @@
       { "method": "GET", "path": "/api/kafka/panel", "query": "panel=&group=&topic=&topics_min=&topics_substring=", "auth": "session cookie required", "notes": "topics_min / topics_substring apply to panel topics_partition_counts only" },
       { "method": "GET", "path": "/api/k8s/stack", "auth": "session", "notes": "Pod replica counts per known Glassbox component in session namespace" },
       { "method": "GET", "path": "/api/clickhouse/panel", "query": "panel=&ch_pod=&hours=&from_ts=&to_ts=&event_table=&tenant_id=", "auth": "session", "notes": "Password from data/sensitive/.ch_password" },
+      { "method": "POST", "path": "/api/kafka/rebalance/analyze", "body": "{}", "auth": "session", "notes": "kubectl exec kafka pod: du -sk /bitnami/kafka/data/*; response table is per-topic total MB (sorted desc) + default_num_brokers (read-only)" },
       { "method": "POST", "path": "/api/kafka/exec", "body": "{ command, confirmed? }", "auth": "session cookie required", "notes": "409 + needs_confirmation when risky and confirmed false" },
       { "method": "POST", "path": "/api/clickhouse/exec", "body": "{ sql, ch_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
       { "method": "GET", "path": "/api/elasticsearch/panel", "query": "panel=&es_pod=&idx_health=&idx_state=&idx_substring=&alloc_body=&index_pattern=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:9200 in ES pod" },

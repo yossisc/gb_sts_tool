@@ -334,12 +334,137 @@ select.text {
   align-items: start;
 }
 
+/* Kafka Groups: row1 = left ~⅓ (list) + right ~⅔ (state → members → verbose); row2 = full-width lag. */
+.kafka-groups-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.kafka-groups-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 1rem;
+  align-items: start;
+  min-width: 0;
+}
+
+.kafka-groups-layout > .kafka-groups-left,
+.kafka-groups-layout > .kafka-groups-right {
+  min-width: 0;
+}
+
+/* Do not use .panels-grid here: minmax(28rem,1fr) blows past the ⅓ track and stretches the list full-width. */
+.kafka-groups-left-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.kafka-groups-left-grid > .panel {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+.kafka-groups-left-grid .data-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.kafka-groups-right {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.kafka-groups-right > .panel {
+  min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.kafka-groups-lag-row {
+  width: 100%;
+  min-width: 0;
+}
+
+.kafka-groups-lag-row > .panel {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+.panel--kafka-group-members-span {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Let scrollable children honor max-height inside grid items */
+.panels-grid > .panel {
+  min-height: 0;
+}
+
 .panel--span-all {
   grid-column: 1 / -1;
 }
 
+.kafka-subject {
+  margin-top: 1.75rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.kafka-subject:first-of-type {
+  margin-top: 0.5rem;
+  padding-top: 0;
+  border-top: none;
+}
+
+.kafka-subject-title {
+  margin: 0 0 0.85rem 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.kafka-subject-params {
+  margin-bottom: 1rem;
+  max-width: 44rem;
+}
+
+.kafka-rebalance-section {
+  margin-top: 1.25rem;
+}
+
+.kafka-rebalance-toolbar {
+  align-items: center;
+}
+
+.kafka-rebalance-th-check,
+.kafka-rebalance-td-check {
+  width: 5.5rem;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.kafka-rebalance-td-check input {
+  margin: 0;
+}
+
 @media (max-width: 52rem) {
   .panels-grid {
+    grid-template-columns: 1fr;
+  }
+  .kafka-groups-layout {
     grid-template-columns: 1fr;
   }
 }
@@ -351,6 +476,11 @@ select.text {
   color: var(--muted);
   font-family: var(--mono);
   word-break: break-all;
+}
+
+.panel-cmd-hint--rich strong.kafka-cmd-hint-value {
+  font-weight: 700;
+  color: var(--on);
 }
 
 .panel-toolbar {
@@ -399,6 +529,56 @@ select.text {
   user-select: none;
 }
 
+.data-table.kafka-describe-summary-table {
+  table-layout: fixed;
+  width: 100%;
+  max-width: 100%;
+}
+
+.data-table.kafka-describe-summary-table td:first-child,
+.data-table.kafka-describe-summary-table th:first-child {
+  width: 12rem;
+  max-width: 12rem;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.data-table.kafka-describe-summary-table td:nth-child(2),
+.data-table.kafka-describe-summary-table th:nth-child(2) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  vertical-align: top;
+}
+
+/*
+ * Topic describe (partitions) & Topic end offsets: scroll **only** the table.
+ * min-height:0 lets max-height work inside CSS grid; fixed max-height ≈ 30 rows.
+ */
+.kafka-topic-table-scroll {
+  min-height: 0;
+  max-height: 32rem;
+  overflow-y: auto;
+  overflow-x: auto;
+  margin: 0 0 0.65rem 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.kafka-topic-table-scroll .data-table {
+  margin: 0;
+}
+
+.kafka-topic-table-scroll .data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  box-shadow: 0 1px 0 var(--border);
+  background: var(--bg);
+}
+
 .data-table.kafka-lag-table {
   table-layout: fixed;
   width: 100%;
@@ -435,26 +615,21 @@ select.text {
   color: var(--accent);
 }
 
-.group-pick-list {
-  margin: 0 0 0.5rem 0;
-  padding-left: 1.1rem;
-  max-height: 10rem;
-  overflow: auto;
-  font-size: 0.85rem;
-}
-
-.group-pick-list button {
+button.cell-link {
+  display: inline;
   background: none;
   border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
   color: var(--accent);
   cursor: pointer;
-  padding: 0;
-  font: inherit;
+  text-decoration: underline;
   text-align: left;
 }
 
-.group-pick-list button:hover {
-  text-decoration: underline;
+button.cell-link:hover {
+  filter: brightness(1.12);
 }
 
 .status-ok {

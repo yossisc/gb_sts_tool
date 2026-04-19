@@ -12,7 +12,7 @@ const navKafka = document.getElementById("nav-kafka");
 const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
 
-const VERSION = "1.0.7";
+const VERSION = "1.0.12";
 
 /** @type {Array<Record<string, unknown>>} */
 let clustersList = [];
@@ -26,15 +26,36 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+/** Rich HTML for ``panel-cmd-hint``: replace ``<T>`` / ``<G>`` with bold values when topic/group are set. */
+function formatKafkaCmdHint(rawHint, topic, group) {
+  const t = (topic || "").trim();
+  const g = (group || "").trim();
+  const parts = String(rawHint || "").split(/(<T>|<G>)/g);
+  return parts
+    .map((part) => {
+      if (part === "<T>") {
+        return t ? `<strong class="kafka-cmd-hint-value">${esc(t)}</strong>` : esc("<T>");
+      }
+      if (part === "<G>") {
+        return g ? `<strong class="kafka-cmd-hint-value">${esc(g)}</strong>` : esc("<G>");
+      }
+      return esc(part);
+    })
+    .join("");
+}
+
 function preWithCopy(rawText) {
   const id = `pre-copy-${++copyBtnSeq}`;
   return `<div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="output-pre" id="${id}">${esc(rawText || "")}</pre></div>`;
 }
 
 /** Kafka panel raw output: nowrap by default + wrap checkbox (bottom-right of block). */
-function kafkaPreWithWrapFooter(rawText) {
+function kafkaPreWithWrapFooter(rawText, opts = {}) {
   const id = `pre-copy-${++copyBtnSeq}`;
-  return `<div class="panel-output-stack"><div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="output-pre output-pre--nowrap" id="${id}">${esc(rawText || "")}</pre></div><div class="panel-output-footer"><label class="wrap-chk"><input type="checkbox" class="js-pre-wrap" data-pre-id="${id}" /> wrap</label></div></div>`;
+  const wrapOn = !!opts.wrapChecked;
+  const preClass = wrapOn ? "output-pre" : "output-pre output-pre--nowrap";
+  const chk = wrapOn ? " checked" : "";
+  return `<div class="panel-output-stack"><div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="${preClass}" id="${id}">${esc(rawText || "")}</pre></div><div class="panel-output-footer"><label class="wrap-chk"><input type="checkbox" class="js-pre-wrap" data-pre-id="${id}"${chk} /> wrap</label></div></div>`;
 }
 
 function bindCopyButtons(root) {
@@ -143,21 +164,63 @@ function setActiveNav() {
   });
 }
 
+/** @param {{ index: number, variant: "topic" | "group" }} pick */
+function kafkaPickCellInner(cell, ci, pick) {
+  if (!pick || pick.index !== ci) return esc(cell == null ? "" : String(cell));
+  const enc = encodeURIComponent(String(cell ?? ""));
+  const cls = pick.variant === "group" ? "js-kafka-pick-group" : "js-kafka-pick-topic";
+  const label = pick.variant === "group" ? "Use this consumer group" : "Use this topic for describe / offsets";
+  return `<button type="button" class="cell-link ${cls}" data-name="${enc}" title="${esc(label)}">${esc(
+    cell == null ? "" : String(cell),
+  )}</button>`;
+}
+
+/** Rebuild ``<tr>`` from string cells; uses ``data-pick-col`` / ``data-pick-variant`` on ``table`` when set. */
+function kafkaDataRowHtml(cells, table) {
+  const pickCol = table.getAttribute("data-pick-col");
+  const pickVar = table.getAttribute("data-pick-variant");
+  const pick =
+    pickCol != null && pickCol !== "" && (pickVar === "topic" || pickVar === "group")
+      ? { index: Number.parseInt(pickCol, 10), variant: /** @type {"topic"|"group"} */ (pickVar) }
+      : null;
+  return `<tr>${cells
+    .map((c, ci) => {
+      const inner = kafkaPickCellInner(c, ci, pick);
+      return `<td>${inner}</td>`;
+    })
+    .join("")}</tr>`;
+}
+
 function renderTable(rows, opts = {}) {
   if (!rows || !rows.length) return "<p class='muted'>(no rows)</p>";
   const escCell = (c) => esc(c == null ? "" : String(c));
   const tc = opts.tableClass ? ` ${opts.tableClass}` : "";
   const thead = opts.theadFirstRow === true;
-  let html = `<table class="data-table${tc}">`;
+  const sortCols = Array.isArray(opts.sortableColumnIndexes) ? opts.sortableColumnIndexes : [];
+  const strSortCols = Array.isArray(opts.stringSortableColumnIndexes) ? opts.stringSortableColumnIndexes : [];
+  const pick = opts.pickColumn || null;
+  let pickAttr = "";
+  if (pick) {
+    pickAttr = ` data-pick-col="${pick.index}" data-pick-variant="${pick.variant}"`;
+  }
+  let html = `<table class="data-table${tc}"${pickAttr}>`;
   let start = 0;
   if (thead) {
     html += "<thead><tr>";
     const hdr = rows[0];
     for (let ci = 0; ci < hdr.length; ci++) {
       const sortPart = opts.sortablePartitions && ci === 0;
-      html += sortPart
-        ? `<th class="th-sortable" data-sort-partitions title="Click to sort by partition count">${escCell(hdr[ci])}</th>`
-        : `<th>${escCell(hdr[ci])}</th>`;
+      const sortCol = sortCols.includes(ci);
+      const strSortCol = strSortCols.includes(ci);
+      if (sortPart) {
+        html += `<th class="th-sortable" data-sort-partitions title="Click to sort by partition count">${escCell(hdr[ci])}</th>`;
+      } else if (sortCol) {
+        html += `<th class="th-sortable" data-sort-col="${ci}" data-sort-kind="number" title="Click to sort asc/desc">${escCell(hdr[ci])}</th>`;
+      } else if (strSortCol) {
+        html += `<th class="th-sortable" data-sort-col="${ci}" data-sort-kind="string" title="Click to sort asc/desc">${escCell(hdr[ci])}</th>`;
+      } else {
+        html += `<th>${escCell(hdr[ci])}</th>`;
+      }
     }
     html += "</tr></thead><tbody>";
     start = 1;
@@ -171,12 +234,17 @@ function renderTable(rows, opts = {}) {
       const cell = row[ci];
       let cls = "";
       if (opts.lagColClasses && opts.lagColClasses[ci]) cls = ` class="${opts.lagColClasses[ci]}"`;
-      html += `<td${cls}>${escCell(cell)}</td>`;
+      html += `<td${cls}>${kafkaPickCellInner(cell, ci, pick)}</td>`;
     }
     html += "</tr>";
   }
   html += "</tbody></table>";
   return html;
+}
+
+/** Fixed-height viewport (~30 rows) with its own scrollbar — only the data table, not cmd hint / raw pre. */
+function kafkaTopicDataTableScroll(tableHtml) {
+  return `<div class="kafka-topic-table-scroll" tabindex="0" role="region" aria-label="Topic data table">${tableHtml}</div>`;
 }
 
 function wireTopicsPartitionSort(elOut) {
@@ -197,9 +265,71 @@ function wireTopicsPartitionSort(elOut) {
       const nb = Number.parseInt(b[0], 10) || 0;
       return mode === "desc" ? nb - na : na - nb;
     });
-    tbody.innerHTML = dataRows
-      .map((cells) => `<tr>${cells.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`)
-      .join("");
+    tbody.innerHTML = dataRows.map((cells) => kafkaDataRowHtml(cells, table)).join("");
+  });
+}
+
+/** Rebalancing panel: one row per topic, checkbox column for topics-to-move JSON. */
+function renderRebalanceTopicTableScroll(table) {
+  if (!table || table.length < 2) {
+    return "<p class='muted'>(no topic sizes parsed)</p>";
+  }
+  let html =
+    '<div class="kafka-topic-table-scroll" tabindex="0" role="region" aria-label="Topic size table"><table class="data-table kafka-rebalance-du-table"><thead><tr>';
+  html += '<th class="kafka-rebalance-th-check" scope="col">Rebalance</th>';
+  html += `<th>${esc(String(table[0][0]))}</th><th>${esc(String(table[0][1]))}</th></tr></thead><tbody>`;
+  for (let i = 1; i < table.length; i++) {
+    const row = table[i];
+    const topic = row[0] == null ? "" : String(row[0]);
+    const sizeMb = row[1] == null ? "" : String(row[1]);
+    const al = `Rebalance ${topic}`;
+    html += `<tr><td class="kafka-rebalance-td-check"><input type="checkbox" class="js-rebalance-pick" data-topic-enc="${encodeURIComponent(
+      topic,
+    )}" title="Include in topics-to-move JSON" aria-label="${esc(al)}" /></td>`;
+    html += `<td>${esc(topic)}</td><td>${esc(sizeMb)}</td></tr>`;
+  }
+  html += "</tbody></table></div>";
+  return html;
+}
+
+function wireKafkaTableHeaderSort(tableRoot) {
+  const table = tableRoot?.querySelector?.("table") || tableRoot;
+  if (!table || table.tagName !== "TABLE") return;
+  const ths = table.querySelectorAll("th[data-sort-col]");
+  ths.forEach((th) => {
+    let mode = "none";
+    th.addEventListener("click", () => {
+      const col = Number.parseInt(th.getAttribute("data-sort-col") || "-1", 10);
+      const kind = th.getAttribute("data-sort-kind") || "number";
+      const tbody = table.querySelector("tbody");
+      if (!tbody || col < 0) return;
+      const dataRows = [...tbody.querySelectorAll("tr")].map((tr) =>
+        [...tr.querySelectorAll("td")].map((td) => (td.textContent || "").trim()),
+      );
+      mode = mode === "none" || mode === "asc" ? "desc" : "asc";
+      if (kind === "string") {
+        th.title = mode === "desc" ? "Sorted: Z → A" : "Sorted: A → Z";
+      } else {
+        th.title = mode === "desc" ? "Sorted: high → low" : "Sorted: low → high";
+      }
+      ths.forEach((o) => {
+        if (o !== th) o.title = "Click to sort asc/desc";
+      });
+      dataRows.sort((a, b) => {
+        const sa = String(a[col] ?? "");
+        const sb = String(b[col] ?? "");
+        if (kind === "string") {
+          const cmp = sa.localeCompare(sb, undefined, { sensitivity: "base" });
+          return mode === "desc" ? -cmp : cmp;
+        }
+        const na = Number.parseFloat(sa.replace(/,/g, ""));
+        const nb = Number.parseFloat(sb.replace(/,/g, ""));
+        const va = Number.isFinite(na) ? na : 0;
+        const vb = Number.isFinite(nb) ? nb : 0;
+        return mode === "desc" ? vb - va : va - vb;
+      });
+      tbody.innerHTML = dataRows.map((cells) => kafkaDataRowHtml(cells, table)).join("");
+    });
   });
 }
 
@@ -228,47 +358,76 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
     }
     let inner = "";
     if (j.cmd_hint) {
-      inner += `<p class="panel-cmd-hint">${esc(j.cmd_hint)}</p>`;
+      inner += `<p class="panel-cmd-hint panel-cmd-hint--rich">${formatKafkaCmdHint(j.cmd_hint, topic, group)}</p>`;
     }
-    if (panelId === "consumer_groups_list" && j.groups && j.groups.length) {
-      inner +=
-        "<ul class=\"group-pick-list\">" +
-        j.groups
-          .map(
-            (name) =>
-              `<li><button type="button" class="js-pick-group" data-name="${encodeURIComponent(name)}">${esc(name)}</button></li>`,
-          )
-          .join("") +
-        "</ul>";
+    if (j.table_summary && j.table_summary.length) {
+      inner += `<p class="hint">Topic summary</p>${renderTable(j.table_summary, {
+        theadFirstRow: true,
+        tableClass: "kafka-describe-summary-table",
+      })}`;
     }
     if (j.table && j.table.length) {
-      if (panelId === "group_lag" && j.table_style === "kafka_lag_describe") {
+      if (panelId === "topic_describe") {
+        inner += `<p class="hint">Partitions</p>${kafkaTopicDataTableScroll(
+          renderTable(j.table, {
+            theadFirstRow: true,
+            tableClass: "kafka-describe-partitions-table",
+            sortableColumnIndexes: [1, 2],
+          }),
+        )}`;
+      } else if (panelId === "group_lag" && j.table_style === "kafka_lag_describe") {
         const lagCols = ["", "", "", "", "", "col-lag", "col-consumer", "", "col-client"];
         inner += renderTable(j.table, {
           theadFirstRow: true,
           tableClass: "kafka-lag-table",
           lagColClasses: lagCols,
         });
+      } else if (panelId === "topic_offsets_end") {
+        inner += kafkaTopicDataTableScroll(
+          renderTable(j.table, {
+            theadFirstRow: true,
+            sortablePartitions: false,
+          }),
+        );
       } else if (panelId === "topics_partition_counts") {
-        inner += renderTable(j.table, { theadFirstRow: true, sortablePartitions: true });
+        inner += renderTable(j.table, {
+          theadFirstRow: true,
+          sortablePartitions: true,
+          pickColumn: { index: 1, variant: "topic" },
+        });
+      } else if (panelId === "consumer_groups_list") {
+        const hdr = j.table && j.table[0];
+        const hasSizeCol = hdr && hdr.length >= 2;
+        inner += renderTable(j.table, {
+          theadFirstRow: true,
+          pickColumn: { index: 0, variant: "group" },
+          stringSortableColumnIndexes: hasSizeCol ? [] : [0],
+          sortableColumnIndexes: hasSizeCol ? [1] : [],
+        });
       } else {
-        inner += renderTable(j.table, { theadFirstRow: panelId === "consumer_groups_list" });
+        inner += renderTable(j.table, { theadFirstRow: true });
       }
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
-    inner += kafkaPreWithWrapFooter(blobOut);
+    inner += kafkaPreWithWrapFooter(blobOut, { wrapChecked: panelId === "group_state" });
     inner += `<p class='hint'>exit ${esc(String(j.returncode))}</p>`;
     elOut.innerHTML = inner;
     bindCopyButtons(elOut);
-    elOut.querySelectorAll(".js-pick-group").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const inp = document.getElementById("kafka-group");
-        const raw = btn.getAttribute("data-name");
-        if (inp) inp.value = raw ? decodeURIComponent(raw) : "";
-      });
-    });
+    if (panelId === "group_lag" && j.ok) {
+      const pan = elOut.closest(".panel");
+      const h2 = pan?.querySelector(".panel-head h2");
+      const gn = (group || "").trim();
+      if (h2) {
+        h2.textContent = gn ? `Group lag (describe) - ${gn}` : "Group lag (describe)";
+      }
+    }
     if (panelId === "topics_partition_counts") {
       wireTopicsPartitionSort(elOut);
+    } else if (panelId === "topic_describe") {
+      const wrap = elOut.querySelector(".kafka-topic-table-scroll");
+      if (wrap) wireKafkaTableHeaderSort(wrap);
+    } else if (panelId === "consumer_groups_list") {
+      wireKafkaTableHeaderSort(elOut);
     }
   } catch (e) {
     const d = e.detail || {};
@@ -279,10 +438,11 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
 }
 
 /**
- * @param {{ spanAll?: boolean, topicsFilters?: boolean }} opts
+ * @param {{ spanAll?: boolean, topicsFilters?: boolean, extraPanelClass?: string }} opts
  */
 function panelCard(title, bodyElId, opts = {}) {
   const span = opts.spanAll ? " panel--span-all" : "";
+  const extra = opts.extraPanelClass ? ` ${opts.extraPanelClass}` : "";
   let filters = "";
   if (opts.topicsFilters) {
     filters = `
@@ -298,7 +458,7 @@ function panelCard(title, bodyElId, opts = {}) {
       </div>`;
   }
   return `
-    <section class="panel${span}">
+    <section class="panel${span}${extra}">
       <div class="panel-head">
         <h2>${esc(title)}</h2>
         <div class="panel-actions">
@@ -1110,20 +1270,55 @@ function renderKafka() {
   }
   app.innerHTML = `
     <p class="muted">Pod <code>glassbox-kafka-0</code> — commands run in the <code>kafka</code> container with a random high <code>JMX_PORT</code> per request to avoid port collisions.</p>
-    <section class="panel">
-      <h2>Parameters for group / topic panels</h2>
-      <div class="form-grid" style="max-width:44rem; grid-template-columns:1fr 1fr;">
-        <label class="field">
-          <span>Consumer group (for lag, state, members)</span>
-          <input class="text" id="kafka-group" type="text" placeholder="beacon_offline_group" autocomplete="off" />
-        </label>
+
+    <section class="kafka-subject" aria-labelledby="kafka-subject-brokers">
+      <h2 class="kafka-subject-title" id="kafka-subject-brokers">Brokers</h2>
+      <div class="panels-grid" id="kafka-grid-brokers"></div>
+    </section>
+
+    <section class="kafka-subject" aria-labelledby="kafka-subject-topics">
+      <h2 class="kafka-subject-title" id="kafka-subject-topics">Topics</h2>
+      <section class="panel kafka-subject-params">
         <label class="field">
           <span>Topic (for describe / end offsets)</span>
           <input class="text" id="kafka-topic" type="text" placeholder="beacon_offline" autocomplete="off" />
         </label>
-      </div>
+      </section>
+      <div class="panels-grid" id="kafka-grid-topics"></div>
     </section>
-    <div class="panels-grid" id="kafka-panels"></div>
+
+    <section class="kafka-subject" aria-labelledby="kafka-subject-groups">
+      <h2 class="kafka-subject-title" id="kafka-subject-groups">Groups</h2>
+      <section class="panel kafka-subject-params">
+        <label class="field">
+          <span>Consumer group (for list pick, lag, state, members)</span>
+          <input class="text" id="kafka-group" type="text" placeholder="beacon_offline_group" autocomplete="off" />
+        </label>
+      </section>
+      <div id="kafka-grid-groups"></div>
+    </section>
+
+    <section class="panel panel--span-all kafka-rebalance-section">
+      <div class="panel-head">
+        <h2>Rebalancing</h2>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-primary" id="rebalance-analyze-btn">Analyze</button>
+        </div>
+      </div>
+      <p class="muted">
+        Read-only scan of <code>/bitnami/kafka/data/*</code> in the Kafka pod (<code>du -sk</code>); sizes are summed per topic and sorted largest first. Commands are copy-paste only; this UI does not run partition reassignment.
+      </p>
+      <div class="panel-toolbar kafka-rebalance-toolbar">
+        <label class="field field--inline">
+          <span>Number of brokers</span>
+          <input class="text text-narrow" id="rebalance-broker-count" type="number" min="1" max="32" step="1" value="3" />
+        </label>
+      </div>
+      <p class="muted" id="rebalance-placeholder">Click <strong>Analyze</strong> to scan data directories and show helper commands.</p>
+      <div id="rebalance-scan-out" hidden></div>
+      <div id="rebalance-commands" hidden></div>
+    </section>
+
     <section class="panel exec-box">
       <h2>Custom command (broker shell)</h2>
       <p class="muted">Runs in the <code>kafka</code> container after a random <code>JMX_PORT</code> export. Write-like commands require confirmation.</p>
@@ -1140,39 +1335,266 @@ function renderKafka() {
       </div>
     </section>
   `;
-  const grid = app.querySelector("#kafka-panels");
+  const gridBrokers = app.querySelector("#kafka-grid-brokers");
+  const gridTopics = app.querySelector("#kafka-grid-topics");
+  const gridGroups = app.querySelector("#kafka-grid-groups");
+
   /** @type {Array<[string, string, string, boolean, boolean, boolean?, boolean?]>} */
-  const panels = [
+  const brokerPanels = [
     ["Broker API versions", "broker_versions", "p-broker-ver", false, false],
     ["Broker default configs (describe)", "broker_default_configs", "p-broker-cfg", false, false],
-    ["Topics × partition counts", "topics_partition_counts", "p-topics", false, false, false, true],
     ["Partition leadership balance", "leader_balance", "p-balance", false, false],
-    ["Consumer groups (list)", "consumer_groups_list", "p-groups", false, false],
-    ["Group state (--state --verbose)", "group_state", "p-g-state", true, false],
-    ["Group members", "group_members", "p-g-mem", true, false],
-    ["Group members + partition assignment", "group_members_verbose", "p-g-memv", true, false],
-    ["Group lag (describe)", "group_lag", "p-lag", true, false, true, false],
+  ];
+  const topicPanels = [
+    ["Topics × partition counts", "topics_partition_counts", "p-topics", false, false, false, true],
     ["Topic describe (head)", "topic_describe", "p-t-desc", false, true],
     ["Topic end offsets (GetOffsetShell)", "topic_offsets_end", "p-t-off", false, true],
   ];
-  let html = "";
-  for (const row of panels) {
-    const [title, , bid, , , spanAll, topicsFilters] = row;
-    html += panelCard(title, bid, { spanAll: !!spanAll, topicsFilters: !!topicsFilters });
+  /** Left ~⅓: consumer list only. Right ~⅔: state → members → verbose. Lag: full-width row below. */
+  const groupPanelsLeft = [["Consumer groups (list)", "consumer_groups_list", "p-groups", false, false]];
+  const groupPanelsLag = [["Group lag (describe)", "group_lag", "p-lag", true, false, true, false]];
+  const groupPanelsRight = [
+    ["Group state (--state --verbose)", "group_state", "p-g-state", true, false],
+    ["Group members", "group_members", "p-g-mem", true, false, false, false, "panel--kafka-group-members-span"],
+    [
+      "Group members + partition assignment",
+      "group_members_verbose",
+      "p-g-memv",
+      true,
+      false,
+      false,
+      false,
+      "panel--kafka-group-members-span",
+    ],
+  ];
+
+  /** @param {HTMLElement | null} gridEl */
+  function fillKafkaGrid(gridEl, rows) {
+    if (!gridEl) return;
+    let html = "";
+    for (const row of rows) {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
+      html += panelCard(title, bid, {
+        spanAll: !!spanAll,
+        topicsFilters: !!topicsFilters,
+        extraPanelClass: typeof extraCls === "string" ? extraCls : "",
+      });
+    }
+    gridEl.innerHTML = html;
   }
-  grid.innerHTML = html;
-  const g = () => app.querySelector("#kafka-group").value.trim();
-  const t = () => app.querySelector("#kafka-topic").value.trim();
+
+  /** @param {HTMLElement | null} rootEl */
+  function fillKafkaGroupsLayout(rootEl, leftRows, rightRows, lagRows) {
+    if (!rootEl) return;
+    let leftHtml = "";
+    for (const row of leftRows) {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
+      leftHtml += panelCard(title, bid, {
+        spanAll: !!spanAll,
+        topicsFilters: !!topicsFilters,
+        extraPanelClass: typeof extraCls === "string" ? extraCls : "",
+      });
+    }
+    let rightHtml = "";
+    for (const row of rightRows) {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
+      rightHtml += panelCard(title, bid, {
+        spanAll: !!spanAll,
+        topicsFilters: !!topicsFilters,
+        extraPanelClass: typeof extraCls === "string" ? extraCls : "",
+      });
+    }
+    let lagHtml = "";
+    for (const row of lagRows) {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
+      lagHtml += panelCard(title, bid, {
+        spanAll: !!spanAll,
+        topicsFilters: !!topicsFilters,
+        extraPanelClass: typeof extraCls === "string" ? extraCls : "",
+      });
+    }
+    rootEl.innerHTML = `<div class="kafka-groups-wrapper">
+      <div class="kafka-groups-layout">
+        <div class="kafka-groups-left kafka-groups-left-grid">${leftHtml}</div>
+        <div class="kafka-groups-right">${rightHtml}</div>
+      </div>
+      <div class="kafka-groups-lag-row">${lagHtml}</div>
+    </div>`;
+  }
+
+  fillKafkaGrid(gridBrokers, brokerPanels);
+  fillKafkaGrid(gridTopics, topicPanels);
+  fillKafkaGroupsLayout(gridGroups, groupPanelsLeft, groupPanelsRight, groupPanelsLag);
+
+  if (!app.dataset.kafkaPickDelegation) {
+    app.dataset.kafkaPickDelegation = "1";
+    app.addEventListener("click", (ev) => {
+      const tp = ev.target.closest("button.js-kafka-pick-topic");
+      if (tp) {
+        const enc = tp.getAttribute("data-name");
+        const inp = document.getElementById("kafka-topic");
+        if (inp && enc != null) inp.value = decodeURIComponent(enc);
+        return;
+      }
+      const gp = ev.target.closest("button.js-kafka-pick-group");
+      if (gp) {
+        const enc = gp.getAttribute("data-name");
+        const inp = document.getElementById("kafka-group");
+        if (inp && enc != null) inp.value = decodeURIComponent(enc);
+      }
+    });
+  }
+
+  function rebalanceBrokerCountFromStorage() {
+    try {
+      const st = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+      const r = st?.components?.kafka?.replicas;
+      if (typeof r === "number" && r >= 1) return Math.min(32, r);
+    } catch {
+      /* ignore */
+    }
+    return 3;
+  }
+
+  const rebInp = app.querySelector("#rebalance-broker-count");
+  if (rebInp) rebInp.value = String(rebalanceBrokerCountFromStorage());
+
+  let rebalanceBrokerUserTouched = false;
+  let rebalanceLastScanOk = false;
+  let rebalanceBtnRefreshMode = false;
+
+  function rebalanceTopicsForJson() {
+    const scanOut = document.getElementById("rebalance-scan-out");
+    if (!scanOut) return [];
+    const topics = [];
+    scanOut.querySelectorAll(".js-rebalance-pick:checked").forEach((el) => {
+      const enc = el.getAttribute("data-topic-enc");
+      if (enc) topics.push(decodeURIComponent(enc));
+    });
+    return topics;
+  }
+
+  function rebalanceBrokerListCsv() {
+    const raw = document.getElementById("rebalance-broker-count")?.value ?? "3";
+    const v = Number.parseInt(String(raw).trim(), 10);
+    const n = Number.isFinite(v) ? Math.min(32, Math.max(1, v)) : 3;
+    return Array.from({ length: n }, (_, i) => String(i)).join(",");
+  }
+
+  function rebalanceCmdWriteJson() {
+    const topics = rebalanceTopicsForJson();
+    const payload = { version: 1, topics: topics.map((t) => ({ topic: t })) };
+    const inner = JSON.stringify(payload);
+    return `echo ${JSON.stringify(inner)} > /tmp/topics-to-move.json`;
+  }
+
+  function renderRebalanceCommands() {
+    const wrap = document.getElementById("rebalance-commands");
+    if (!wrap) return;
+    wrap.hidden = false;
+    const br = rebalanceBrokerListCsv();
+    const kb = "/opt/bitnami/kafka/bin/kafka-reassign-partitions.sh";
+    const c2 = `${kb} --bootstrap-server 127.0.0.1:9092 --topics-to-move-json-file /tmp/topics-to-move.json --broker-list ${br} --generate`;
+    const c2b = `${c2} | tail -1 > /tmp/reassignment_file.json`;
+    const c3 = `${kb} --bootstrap-server 127.0.0.1:9092 --reassignment-json-file /tmp/reassignment_file.json --execute`;
+    wrap.innerHTML = `<h3 class="hint">1. Write topics JSON</h3>
+${preWithCopy(rebalanceCmdWriteJson())}
+<h3 class="hint">2. Generate reassignment plan</h3>
+${preWithCopy(c2)}
+<p class="muted">Capture only the reassignment JSON (last line):</p>
+${preWithCopy(c2b)}
+<h3 class="hint">3. Execute (review <code>/tmp/reassignment_file.json</code> first)</h3>
+${preWithCopy(c3)}`;
+    bindCopyButtons(wrap);
+  }
+
+  function refreshRebalanceCommandsIfNeeded() {
+    if (rebalanceLastScanOk) renderRebalanceCommands();
+  }
+
+  rebInp?.addEventListener("input", () => {
+    rebalanceBrokerUserTouched = true;
+    refreshRebalanceCommandsIfNeeded();
+  });
+
+  document.getElementById("rebalance-scan-out")?.addEventListener("change", (ev) => {
+    const t = ev.target;
+    if (t instanceof HTMLInputElement && t.classList.contains("js-rebalance-pick")) {
+      refreshRebalanceCommandsIfNeeded();
+    }
+  });
+
+  async function runRebalanceAnalyze() {
+    const btn = document.getElementById("rebalance-analyze-btn");
+    const placeholder = document.getElementById("rebalance-placeholder");
+    const scanOut = document.getElementById("rebalance-scan-out");
+    const cmdWrap = document.getElementById("rebalance-commands");
+    if (!btn || !placeholder || !scanOut || !cmdWrap) return;
+    btn.disabled = true;
+    scanOut.hidden = false;
+    scanOut.innerHTML = "<p class='muted'>Scanning…</p>";
+    cmdWrap.hidden = true;
+    cmdWrap.innerHTML = "";
+    rebalanceLastScanOk = false;
+    try {
+      const j = await fetchJson("/api/kafka/rebalance/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!rebalanceBrokerUserTouched && typeof j.default_num_brokers === "number") {
+        const inp = document.getElementById("rebalance-broker-count");
+        if (inp) inp.value = String(Math.min(32, Math.max(1, j.default_num_brokers)));
+      }
+      let scanHtml = "";
+      if (j.table && j.table.length > 1) {
+        scanHtml += `${renderRebalanceTopicTableScroll(j.table)}`;
+      } else {
+        scanHtml += "<p class='muted'>(no topic sizes parsed)</p>";
+      }
+      if (!j.ok) {
+        scanOut.innerHTML = `<p class="status-bad">${esc(String(j.error || j.stderr || "scan failed"))}</p>${scanHtml}`;
+        return;
+      }
+      placeholder.hidden = true;
+      scanOut.innerHTML = scanHtml;
+      rebalanceLastScanOk = true;
+      renderRebalanceCommands();
+      if (!rebalanceBtnRefreshMode) {
+        rebalanceBtnRefreshMode = true;
+        btn.textContent = "Refresh";
+      }
+    } catch (e) {
+      const d = /** @type {Record<string, unknown>} */ (e.detail || {});
+      const extra = d.error != null ? `<p class="muted">${esc(String(d.error))}</p>` : "";
+      scanOut.innerHTML = `<p class="status-bad">${esc(e.message)}</p>${extra}`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById("rebalance-analyze-btn")?.addEventListener("click", () => runRebalanceAnalyze());
+
+  const g = () => app.querySelector("#kafka-group")?.value.trim() ?? "";
+  const t = () => app.querySelector("#kafka-topic")?.value.trim() ?? "";
   const topicsFetchOpts = () => ({
     topicsMin: document.getElementById("kafka-topics-min")?.value ?? "",
     topicsSubstring: document.getElementById("kafka-topics-substring")?.value ?? "",
   });
-  for (const row of panels) {
-    const [, pid, bid, needsGroup, needsTopic, , topicsFilters] = row;
-    const opts = { needsGroup, needsTopic };
-    if (topicsFilters) opts.getFetchOpts = topicsFetchOpts;
-    wirePanelRefresh(grid, bid, pid, g, t, opts);
+
+  function wireKafkaRows(gridEl, rows) {
+    if (!gridEl) return;
+    for (const row of rows) {
+      const [, pid, bid, needsGroup, needsTopic, , topicsFilters] = row;
+      const opts = { needsGroup, needsTopic };
+      if (topicsFilters) opts.getFetchOpts = topicsFetchOpts;
+      wirePanelRefresh(gridEl, bid, pid, g, t, opts);
+    }
   }
+
+  wireKafkaRows(gridBrokers, brokerPanels);
+  wireKafkaRows(gridTopics, topicPanels);
+  wireKafkaRows(gridGroups, [...groupPanelsLeft, ...groupPanelsRight, ...groupPanelsLag]);
 
   const execWrap = app.querySelector("#exec-out-wrap");
   const execInner = app.querySelector("#exec-out-inner");

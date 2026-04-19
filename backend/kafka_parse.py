@@ -49,6 +49,192 @@ def parse_consumer_group_names(stdout: str) -> list[str]:
     return sorted(set(names), key=lambda s: s.casefold())
 
 
+def parse_all_groups_describe_row_counts(stdout: str) -> dict[str, int]:
+    """
+    Parse ``kafka-consumer-groups.sh --describe --all-groups`` table lines
+    (GROUP TOPIC PARTITION CURRENT-OFFSET ... LAG ...) and count data rows per group.
+    Used as a rough relative size signal (not authoritative disk usage).
+    """
+    counts: dict[str, int] = {}
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 9:
+            continue
+        if parts[0].upper() == "GROUP" and parts[1].upper() == "TOPIC":
+            continue
+        g = parts[0]
+        try:
+            int(parts[5])
+        except (ValueError, IndexError):
+            continue
+        if not parts[2].isdigit():
+            continue
+        counts[g] = counts.get(g, 0) + 1
+    return counts
+
+
+def consumer_groups_list_split_panel_stdout(stdout: str) -> tuple[str, str]:
+    """Split combined list + ``--all-groups`` script output into (list_body, describe_body)."""
+    raw = stdout or ""
+    m_list = "---GB_STS_LIST---"
+    m_desc = "---GB_STS_DESCRIBE_ALL---"
+    if m_list not in raw or m_desc not in raw:
+        return raw.strip(), ""
+    _, b = raw.split(m_list, 1)
+    list_part, desc_part = b.split(m_desc, 1)
+    return list_part.strip(), desc_part.strip()
+
+
+_PART_LINE_RE = re.compile(
+    r"Topic:\s*(?P<topic>\S+)\s+Partition:\s*(?P<partition>\d+)\s+"
+    r"Leader:\s*(?P<leader>\S+)\s+Replicas:\s*(?P<replicas>\S+)\s+Isr:\s*(?P<isr>\S+)\s*$",
+    re.I,
+)
+
+
+_TOPIC_SUMMARY_RE = re.compile(
+    r"^Topic:\s*(?P<Topic>\S+)\s+TopicId:\s*(?P<TopicId>\S+)\s+PartitionCount:\s*(?P<PartitionCount>\d+)\s+"
+    r"ReplicationFactor:\s*(?P<ReplicationFactor>\d+)\s+Configs:\s*(?P<Configs>.+)$"
+)
+
+
+def parse_topic_describe(stdout: str) -> tuple[list[list[str]], list[list[str]]]:
+    """
+    Parse ``kafka-topics.sh --describe --topic`` output.
+
+    Returns ``(summary_table, partition_table)`` each with header row, or ``[]`` if nothing parsed.
+    Summary is key/value rows; partitions are Topic, Partition, Leader, Replicas, Isr.
+    """
+    summary_kv: dict[str, str] = {}
+    part_rows: list[list[str]] = []
+    for raw in stdout.splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        m = _PART_LINE_RE.search(ln)
+        if m:
+            part_rows.append(
+                [
+                    m.group("topic"),
+                    m.group("partition"),
+                    m.group("leader"),
+                    m.group("replicas"),
+                    m.group("isr"),
+                ]
+            )
+            continue
+        sm = _TOPIC_SUMMARY_RE.match(ln)
+        if sm:
+            for k, v in sm.groupdict().items():
+                if v is not None:
+                    summary_kv[k] = v.strip()
+            continue
+        if "\t" in ln:
+            for chunk in ln.split("\t"):
+                chunk = chunk.strip()
+                if ":" in chunk:
+                    k, _, v = chunk.partition(":")
+                    summary_kv[k.strip()] = v.strip()
+        else:
+            for chunk in re.split(r"\s{2,}", ln):
+                chunk = chunk.strip()
+                if ":" in chunk and not _PART_LINE_RE.search(chunk):
+                    k, _, v = chunk.partition(":")
+                    summary_kv[k.strip()] = v.strip()
+
+    summary_table: list[list[str]] = []
+    if summary_kv:
+        summary_table = [["Key", "Value"]] + [[k, summary_kv[k]] for k in sorted(summary_kv.keys(), key=str.casefold)]
+
+    part_table: list[list[str]] = []
+    if part_rows:
+        part_table = [["Topic", "Partition", "Leader", "Replicas", "Isr"]] + part_rows
+    return summary_table, part_table
+
+
+def parse_topic_end_offsets(stdout: str) -> list[list[str]]:
+    """
+    Parse ``GetOffsetShell`` lines ``topic:partition:end_offset``.
+    Returns table with header, or ``[]`` if nothing parsed.
+    """
+    rows: list[list[str]] = []
+    for raw in stdout.splitlines():
+        ln = raw.strip()
+        if not ln or ln.startswith("#") or ln.upper().startswith("ERROR"):
+            continue
+        parts = ln.rsplit(":", 2)
+        if len(parts) != 3:
+            continue
+        topic, part, off = parts[0], parts[1], parts[2]
+        if not part.isdigit():
+            continue
+        if not re.fullmatch(r"-?\d+", off):
+            continue
+        rows.append([topic, part, off])
+    rows.sort(key=lambda r: (r[0].casefold(), int(r[1])))
+    if not rows:
+        return []
+    return [["Topic", "Partition", "End offset"]] + rows
+
+
+def parse_du_kafka_data_dirs(stdout: str) -> list[list[str]]:
+    """
+    Parse ``du -sk`` lines under ``/bitnami/kafka/data/*`` (size KB, path).
+    Returns a table with header ``Topic, Partition, Size (KB), Path``.
+    Directory names are usually ``<topic>-<partition>``.
+    """
+    header = ["Topic", "Partition", "Size (KB)", "Path"]
+    rows: list[list[str]] = []
+    for raw in stdout.splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        if "\t" in ln:
+            sk, path = ln.split("\t", 1)
+        else:
+            bits = re.split(r"\s+", ln, maxsplit=1)
+            if len(bits) != 2:
+                continue
+            sk, path = bits[0], bits[1]
+        sk = sk.strip()
+        path = path.strip()
+        if not sk.isdigit():
+            continue
+        basename = path.rsplit("/", 1)[-1]
+        m = re.match(r"^(.+)-(\d+)$", basename)
+        if m:
+            topic, part = m.group(1), m.group(2)
+        else:
+            topic, part = basename, ""
+        rows.append([topic, part, sk, path])
+    if not rows:
+        return []
+    return [header] + rows
+
+
+def aggregate_du_kafka_data_by_topic(stdout: str) -> list[list[str]]:
+    """
+    Parse ``du -sk`` under ``/bitnami/kafka/data/*``, sum kilobytes per topic, return
+    ``[["Topic", "Size (MB)"], ...]`` sorted by total size descending.
+    """
+    per_part = parse_du_kafka_data_dirs(stdout)
+    if len(per_part) < 2:
+        return []
+    totals: dict[str, int] = {}
+    for row in per_part[1:]:
+        if len(row) < 3:
+            continue
+        topic, sk = row[0], row[2]
+        if not str(sk).isdigit():
+            continue
+        totals[topic] = totals.get(topic, 0) + int(sk)
+    rows_sorted = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+    return [["Topic", "Size (MB)"]] + [[t, f"{kb / 1024.0:.2f}"] for t, kb in rows_sorted]
+
+
 def filter_topic_partition_rows(
     rows: list[list[str]],
     *,

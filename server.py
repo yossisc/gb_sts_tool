@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.7"
+VERSION = "1.0.12"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -119,7 +119,7 @@ PANEL_CMD_HINT: dict[str, str] = {
     "broker_default_configs": f"{kx.KAFKA_BIN}/kafka-configs.sh --bootstrap-server {kx.BOOTSTRAP} --entity-type brokers --entity-name <id> --describe (per broker id seen in topic metadata)",
     "topics_partition_counts": f"{kx.KAFKA_BIN}/kafka-topics.sh --describe --bootstrap-server {kx.BOOTSTRAP} | grep Topic | awk '{{print $2}}' | sort | uniq -c",
     "leader_balance": f"{kx.KAFKA_BIN}/kafka-topics.sh --describe --bootstrap-server {kx.BOOTSTRAP} (aggregate Leader: counts per broker id)",
-    "consumer_groups_list": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --list",
+    "consumer_groups_list": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --list; plus --describe --all-groups (truncated) to estimate Group size (MB) from assignment row counts",
     "group_state": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --state --verbose",
     "group_members": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --members",
     "group_members_verbose": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --members --verbose",
@@ -246,7 +246,14 @@ rm -f "$D"
 """
         return (inner, None)
     if panel == "consumer_groups_list":
-        return (f"{kb}/kafka-consumer-groups.sh --bootstrap-server {bs} --list 2>&1 | head -n 2000", None)
+        inner = (
+            f"LISTF=$(mktemp); DESCF=$(mktemp); "
+            f"{kb}/kafka-consumer-groups.sh --bootstrap-server {bs} --list 2>&1 | head -n 2000 >\"$LISTF\" || true; "
+            f"{kb}/kafka-consumer-groups.sh --bootstrap-server {bs} --describe --all-groups 2>&1 | head -n 500000 >\"$DESCF\" || true; "
+            f"echo '---GB_STS_LIST---'; cat \"$LISTF\"; echo '---GB_STS_DESCRIBE_ALL---'; cat \"$DESCF\"; "
+            f"rm -f \"$LISTF\" \"$DESCF\""
+        )
+        return (inner, None)
     if panel == "group_state":
         try:
             g = kx.sanitize_name(group, "Consumer group")
@@ -294,7 +301,7 @@ rm -f "$D"
             return None, str(e)
         return (
             f"{kb}/kafka-run-class.sh kafka.tools.GetOffsetShell --broker-list {bs} --topic {shlex.quote(t)} "
-            f"--time -1 2>&1 | head -n 400",
+            f"--time -1 2>&1 | head -n 8000",
             None,
         )
     if panel == "topic_describe":
@@ -303,7 +310,7 @@ rm -f "$D"
         except ValueError as e:
             return None, str(e)
         return (
-            f"{kb}/kafka-topics.sh --describe --bootstrap-server {bs} --topic {shlex.quote(t)} 2>&1 | head -n 80",
+            f"{kb}/kafka-topics.sh --describe --bootstrap-server {bs} --topic {shlex.quote(t)} 2>&1 | head -n 8000",
             None,
         )
     return None, "unknown panel"
@@ -589,9 +596,19 @@ class Handler(SimpleHTTPRequestHandler):
                         rows.append([m.group(1), m.group(2)])
                 out["table"] = [["Broker id", "Partitions led"]] + rows
             elif panel == "consumer_groups_list":
-                names = kparse.parse_consumer_group_names(r.stdout)
+                list_body, desc_body = kparse.consumer_groups_list_split_panel_stdout(r.stdout or "")
+                names = kparse.parse_consumer_group_names(list_body)
                 out["groups"] = names
-                out["table"] = [["Group"]] + [[n] for n in names]
+                counts = kparse.parse_all_groups_describe_row_counts(desc_body)
+                if counts:
+                    rows_tbl: list[list[str]] = []
+                    for n in names:
+                        rc = int(counts.get(n, 0))
+                        mb = (rc * 96.0) / (1024.0 * 1024.0)
+                        rows_tbl.append([n, f"{mb:.4f}"])
+                    out["table"] = [["Group", "Group size (MB)"]] + rows_tbl
+                else:
+                    out["table"] = [["Group"]] + [[n] for n in names]
             elif panel == "group_lag":
                 lag_rows, lag_hdr = kparse.parse_group_lag_rows(r.stdout, limit=5)
                 if lag_hdr and lag_rows:
@@ -599,6 +616,16 @@ class Handler(SimpleHTTPRequestHandler):
                     out["table_style"] = "kafka_lag_describe"
                 else:
                     out["table"] = kx.parse_consumer_group_describe(r.stdout)
+            elif panel == "topic_describe":
+                summ, parts = kparse.parse_topic_describe(r.stdout)
+                if summ:
+                    out["table_summary"] = summ
+                if parts:
+                    out["table"] = parts
+            elif panel == "topic_offsets_end":
+                off_tbl = kparse.parse_topic_end_offsets(r.stdout)
+                if off_tbl:
+                    out["table"] = off_tbl
             self._json(out)
             return
 
@@ -631,6 +658,38 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"ok": False, "error": err, "clusters": []}, HTTPStatus.BAD_GATEWAY)
                 return
             self._json({"ok": True, "clusters": clusters, "cloud": cloud, "region": region})
+            return
+
+        if path == "/api/kafka/rebalance/analyze":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            inner = "du -sk /bitnami/kafka/data/* 2>/dev/null | sort -rn | head -n 400"
+            r = kx.kafka_bash_exec(ns, inner, timeout=180, aws_profile=ap, cloud=cl)
+            tbl = kparse.aggregate_du_kafka_data_by_topic(r.stdout or "")
+            stk = stack.probe_stack_in_namespace(ns, aws_profile=ap, cloud=cl)
+            n_default = 3
+            if stk.get("ok") and isinstance(stk.get("components"), dict):
+                kc = stk["components"].get("kafka") or {}
+                try:
+                    n_default = int(kc.get("replicas") or 3)
+                except (TypeError, ValueError):
+                    n_default = 3
+            n_default = max(1, min(n_default, 32))
+            self._json(
+                {
+                    "ok": r.ok,
+                    "table": tbl,
+                    "default_num_brokers": n_default,
+                    "stdout": "" if r.ok else kx.tail_lines(r.stdout or "", 2000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                }
+            )
             return
 
         if path == "/api/k8s/verify":

@@ -1,0 +1,123 @@
+"""Predefined ClickHouse panel SQL (parameterized time range + event table)."""
+
+from __future__ import annotations
+
+import re
+import shlex
+from typing import Final
+
+_SAFE_EVENT = re.compile(r"^(beacon_event|mobile_event)$")
+_TENANT_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_TS_FREE = re.compile(r"^[0-9 T:\+\-\.Z]{8,48}$")
+
+CH_PANEL_CMD_HINT: dict[str, str] = {
+    "ch_max_session_ts": "clickhouse-client --password … -q 'SELECT toDateTime(max(session_ts)) …'",
+    "ch_events_sessions_by_hour": "clickhouse-client … -q 'SELECT count(*) … GROUP BY day, hour …'",
+    "ch_system_clusters": "clickhouse-client … -q \"SELECT * FROM system.clusters WHERE cluster='analytics'\"",
+    "ch_system_processes": "clickhouse-client … -q 'SELECT … FROM system.processes …'",
+    "ch_beacon_tenant_hour": "clickhouse-client … -q '… beacon_event … tenant_id = …'",
+    "ch_mobile_by_hour": "clickhouse-client … -q '… mobile_event …'",
+    "ch_beacon_by_hour": "clickhouse-client … -q '… beacon_event …'",
+}
+
+CH_PANEL_IDS: Final[frozenset[str]] = frozenset(CH_PANEL_CMD_HINT.keys())
+
+
+def qualified_table(event_table: str) -> str:
+    if not _SAFE_EVENT.match((event_table or "").strip()):
+        raise ValueError("event_table must be beacon_event or mobile_event")
+    return f"glassbox.{event_table.strip()}"
+
+
+def time_predicate(hours: int, from_ts: str, to_ts: str) -> str:
+    """Default: last N hours on ``session_ts``; optional absolute window."""
+    f = (from_ts or "").strip()
+    t = (to_ts or "").strip()
+    if f and t:
+        if not _TS_FREE.match(f) or not _TS_FREE.match(t):
+            raise ValueError("from_ts / to_ts: use safe ISO-like timestamps only")
+        return (
+            "session_ts >= parseDateTimeBestEffort("
+            + shlex.quote(f)
+            + ") AND session_ts < parseDateTimeBestEffort("
+            + shlex.quote(t)
+            + ")"
+        )
+    h = int(hours) if hours else 24
+    h = max(1, min(h, 336))
+    return f"session_ts >= now() - toIntervalHour({h})"
+
+
+def sanitize_tenant_id(raw: str) -> str:
+    v = (raw or "").strip()
+    if not v:
+        raise ValueError("tenant_id is required for this panel")
+    if not _TENANT_UUID.match(v):
+        raise ValueError("tenant_id must be a UUID")
+    return v
+
+
+def sql_for_panel(
+    panel: str,
+    *,
+    event_table: str = "beacon_event",
+    hours: int = 24,
+    from_ts: str = "",
+    to_ts: str = "",
+    tenant_id: str = "",
+) -> str:
+    if panel not in CH_PANEL_IDS:
+        raise ValueError("unknown ClickHouse panel")
+    table = qualified_table(event_table)
+    tw = time_predicate(hours, from_ts, to_ts)
+
+    if panel == "ch_max_session_ts":
+        return f"SELECT toDateTime(max(session_ts)) AS max_session_ts FROM {table}"
+
+    if panel == "ch_events_sessions_by_hour":
+        return (
+            f"SELECT count(*) AS events, uniq(session_uuid) AS sessions, "
+            f"toYYYYMMDD(toDateTime(session_ts)) AS day, toHour(toDateTime(session_ts)) AS hour "
+            f"FROM {table} WHERE {tw} GROUP BY day, hour ORDER BY day DESC, hour DESC"
+        )
+
+    if panel == "ch_system_clusters":
+        return "SELECT * FROM system.clusters WHERE cluster = 'analytics'"
+
+    if panel == "ch_system_processes":
+        return (
+            "SELECT query_id, user, address, elapsed, query FROM system.processes ORDER BY query_id"
+        )
+
+    if panel == "ch_beacon_tenant_hour":
+        if event_table != "beacon_event":
+            raise ValueError("This panel is for beacon_event only")
+        tid = sanitize_tenant_id(tenant_id)
+        return (
+            "SELECT count(*) AS cnt, host, count(DISTINCT session_uuid) AS uniq_sessions, "
+            "toYYYYMMDD(toDateTime(session_ts, 'Etc/GMT')) AS day, "
+            "toHour(toDateTime(session_ts, 'Etc/GMT')) AS hour "
+            f"FROM {table} WHERE tenant_id = {shlex.quote(tid)} AND ({tw}) "
+            "GROUP BY host, day, hour ORDER BY cnt DESC, hour ASC"
+        )
+
+    if panel == "ch_mobile_by_hour":
+        if event_table != "mobile_event":
+            raise ValueError("This panel is for mobile_event only")
+        return (
+            "SELECT count(*) AS cnt, count(DISTINCT session_uuid) AS uniq_sessions, "
+            "toYYYYMMDD(toDateTime(session_ts, 'Etc/GMT')) AS day, "
+            "toHour(toDateTime(session_ts, 'Etc/GMT')) AS hour "
+            f"FROM {table} WHERE ({tw}) GROUP BY day, hour ORDER BY cnt DESC, hour ASC"
+        )
+
+    if panel == "ch_beacon_by_hour":
+        if event_table != "beacon_event":
+            raise ValueError("This panel is for beacon_event only")
+        return (
+            "SELECT count(*) AS cnt, count(DISTINCT session_uuid) AS uniq_sessions, "
+            "toYYYYMMDD(toDateTime(session_ts)) AS day, toHour(toDateTime(session_ts)) AS hour "
+            f"FROM {table} WHERE ({tw}) GROUP BY day, hour ORDER BY day DESC, hour ASC"
+        )
+
+    raise ValueError("unknown panel")

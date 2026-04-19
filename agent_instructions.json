@@ -1,0 +1,63 @@
+{
+  "document_type": "gb_sts_tool.ai_agent_instructions",
+  "version": 1,
+  "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
+  "repo": {
+    "name": "Glassbox STS Tool",
+    "app_version": "1.0.7",
+    "runtime": {
+      "entrypoint": "server.py",
+      "launcher": "run",
+      "bind_env": "GB_STS_BIND",
+      "port_env": "GB_STS_PORT",
+      "cookie_secret_env": "GB_STS_COOKIE_SECRET"
+    }
+  },
+  "rules_summary": [
+    "Default read-only. No silent mutations.",
+    "Write/destructive kubectl or Kafka actions require explicit UI confirmation and server acknowledged confirmed flag.",
+    "kubectl exec uses -c kafka; each exec sets export JMX_PORT=<random high port> to avoid JMX bind collisions",
+    "sanitize_name pattern ^[A-Za-z0-9_.-]+$ for topic/group/namespace user input",
+    "AWS profile dropdown uses a fixed list in backend/aws_profiles.py (not ~/.aws/credentials); session key p → AWS_PROFILE on every kubectl",
+    "AWS (cloud=aws): subprocess_env merges ~/.aws/credentials keys for the selected profile into each kubectl/aws child process",
+    "ClickHouse password: operator file data/sensitive/.ch_password (gitignored)",
+    "Bump VERSION in server.py and mirrored cache-bust / footer on every release",
+    "kubectl context must remain visible in the header"
+  ],
+  "http_api": {
+    "routes": [
+      { "method": "GET", "path": "/api/aws/profiles", "response": "{ ok, profiles[], default_profile, meta{ source: builtin } } — fixed list, does not read ~/.aws" },
+      { "method": "GET", "path": "/api/about", "notes": "version, name, kafka_pod" },
+      { "method": "GET", "path": "/api/k8s/defaults", "notes": "Home defaults from data/sensitive/last_connected.json + regions + clouds" },
+      { "method": "GET", "path": "/api/k8s/context", "notes": "current_context, cluster_server, cloud, aws_profile" },
+      { "method": "GET", "path": "/api/session/status", "notes": "verified + session payload" },
+      { "method": "POST", "path": "/api/clusters/list", "body": "{ cloud, region, aws_profile? }" },
+      { "method": "POST", "path": "/api/k8s/verify", "body": "{ connect?, cluster_name?, namespace?, aws_profile?, cloud?, region? }", "effect": "Optional aws eks update-kubeconfig / az aks get-credentials; then cluster-info; writes data/sensitive/last_connected.json" },
+      { "method": "POST", "path": "/api/session/clear", "effect": "Clear session cookie" },
+      { "method": "GET", "path": "/api/kafka/panel", "query": "panel=&group=&topic=&topics_min=&topics_substring=", "auth": "session cookie required", "notes": "topics_min / topics_substring apply to panel topics_partition_counts only" },
+      { "method": "GET", "path": "/api/k8s/stack", "auth": "session", "notes": "Pod replica counts per known Glassbox component in session namespace" },
+      { "method": "GET", "path": "/api/clickhouse/panel", "query": "panel=&ch_pod=&hours=&from_ts=&to_ts=&event_table=&tenant_id=", "auth": "session", "notes": "Password from data/sensitive/.ch_password" },
+      { "method": "POST", "path": "/api/kafka/exec", "body": "{ command, confirmed? }", "auth": "session cookie required", "notes": "409 + needs_confirmation when risky and confirmed false" },
+      { "method": "POST", "path": "/api/clickhouse/exec", "body": "{ sql, ch_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
+      { "method": "GET", "path": "/api/elasticsearch/panel", "query": "panel=&es_pod=&idx_health=&idx_state=&idx_substring=&alloc_body=&index_pattern=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:9200 in ES pod" },
+      { "method": "POST", "path": "/api/elasticsearch/exec", "body": "{ path, method: GET, es_pod, confirmed? }", "auth": "session", "notes": "Custom GET path only; 409 if path not on allowlist" }
+    ]
+  },
+  "kafka": {
+    "pod": "glassbox-kafka-0",
+    "kubectl_container": "kafka",
+    "bootstrap_inside_pod": "127.0.0.1:9092",
+    "bin_prefix": "/opt/bitnami/kafka/bin"
+  },
+  "clickhouse": {
+    "pod_prefix": "glassbox-clickhouse-",
+    "kubectl_container": "glassbox-clickhouse",
+    "password_file": "data/sensitive/.ch_password"
+  },
+  "elasticsearch": {
+    "pod_prefix": "glassbox-elasticsearch-master-",
+    "kubectl_container_env": "GB_STS_ES_CONTAINER",
+    "kubectl_container_default": "elasticsearch",
+    "http_inside_pod": "http://127.0.0.1:9200"
+  }
+}

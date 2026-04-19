@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Glassbox STS Tool</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="css/app.css?v=1.0.7" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <h1>Glassbox STS Tool</h1>
+      <p class="tagline">Read-first Kafka, ClickHouse &amp; Elasticsearch diagnostics via kubectl</p>
+    </div>
+    <div class="k8s-strip" id="k8s-strip" title="Current kubectl context (refreshed periodically)">
+      <span class="k8s-strip-label">kubectl context</span>
+      <code class="k8s-strip-value" id="k8s-context">…</code>
+      <span class="k8s-strip-sub muted" id="k8s-aws"></span>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/" data-route>Home</a>
+      <a href="#/kafka" data-route id="nav-kafka" class="nav-gated" hidden>Kafka</a>
+      <a href="#/clickhouse" data-route id="nav-clickhouse" class="nav-gated" hidden>ClickHouse</a>
+      <a href="#/elasticsearch" data-route id="nav-elasticsearch" class="nav-gated" hidden>Elasticsearch</a>
+    </nav>
+  </header>
+
+  <main id="app" class="main"></main>
+
+  <footer class="footer">
+    <span id="footer-status">v1.0.7</span>
+    <span class="footer-sep">·</span>
+    <span id="footer-session" class="muted"></span>
+  </footer>
+
+  <script type="module" src="js/app.js?v=1.0.7"></script>
+</body>
+</html>

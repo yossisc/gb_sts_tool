@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+
+# Operator-local sensitive data (keep directory tracked via .gitkeep)
+data/sensitive/*
+!data/sensitive/.gitkeep

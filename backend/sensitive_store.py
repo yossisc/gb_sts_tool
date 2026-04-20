@@ -14,6 +14,7 @@ SENSITIVE_DIR = ROOT / "data" / "sensitive"
 LAST_CONNECTED_FILE = SENSITIVE_DIR / "last_connected.json"
 # Operator-created file; gitignored via data/sensitive/*
 CLICKHOUSE_PASSWORD_FILE = SENSITIVE_DIR / ".ch_password"
+POSTGRES_PASSWORD_FILE = SENSITIVE_DIR / ".pg_password"
 
 
 def ensure_sensitive_dir() -> None:
@@ -30,6 +31,17 @@ def read_clickhouse_password() -> str | None:
         return None
     try:
         raw = CLICKHOUSE_PASSWORD_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw or None
+
+
+def read_postgres_password() -> str | None:
+    """Single-line ``PGPASSWORD`` for ``psql`` in the PostgreSQL pod (file is gitignored)."""
+    if not POSTGRES_PASSWORD_FILE.is_file():
+        return None
+    try:
+        raw = POSTGRES_PASSWORD_FILE.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return raw or None

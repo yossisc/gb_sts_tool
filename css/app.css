@@ -512,6 +512,82 @@ select.text {
   resize: vertical;
 }
 
+.workload-logs-h2 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  margin: 0;
+  flex: 1 1 auto;
+}
+
+.workload-logs-filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: normal;
+}
+
+.workload-logs-filter-label input {
+  min-width: 10rem;
+}
+
+.workload-logs-head {
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+
+.workload-logs-display {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 22rem;
+  margin-top: 0.75rem;
+  min-height: 12rem;
+  padding: 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.log-line-row {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+mark.log-line-hit {
+  background: #ffff00;
+  color: #111;
+  padding: 0 0.06em;
+}
+
+.query-history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 0.75rem;
+  max-height: 9rem;
+  overflow: auto;
+}
+
+.query-history-list li {
+  margin-bottom: 0.25rem;
+}
+
+button.query-history-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .kafka-rebalance-th-check,
 .kafka-rebalance-td-check {
   width: 5.5rem;
@@ -815,6 +891,22 @@ button.cell-link:hover {
   color: var(--text);
   font-family: var(--mono);
   font-size: 0.85rem;
+}
+
+.aws-expiry-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.4rem 0 0 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.aws-expiry-list li {
+  margin: 0.2rem 0;
+}
+
+.aws-expiry-list code {
+  font-size: 0.78em;
 }
 
 .hint {

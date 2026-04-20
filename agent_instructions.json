@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.12",
+    "app_version": "1.0.16",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",
@@ -21,6 +21,8 @@
     "AWS profile dropdown uses a fixed list in backend/aws_profiles.py (not ~/.aws/credentials); session key p → AWS_PROFILE on every kubectl",
     "AWS (cloud=aws): subprocess_env merges ~/.aws/credentials keys for the selected profile into each kubectl/aws child process",
     "ClickHouse password: operator file data/sensitive/.ch_password (gitignored)",
+    "PostgreSQL password: operator file data/sensitive/.pg_password (gitignored) for psql user clarisite",
+    "kubectl log streaming: GET /api/k8s/logs/stream?workload=&pod=&container= (session); leaving a page calls stopWorkloadLogStream()",
     "Bump VERSION in server.py and mirrored cache-bust / footer on every release",
     "kubectl context must remain visible in the header"
   ],
@@ -41,7 +43,12 @@
       { "method": "POST", "path": "/api/kafka/exec", "body": "{ command, confirmed? }", "auth": "session cookie required", "notes": "409 + needs_confirmation when risky and confirmed false" },
       { "method": "POST", "path": "/api/clickhouse/exec", "body": "{ sql, ch_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
       { "method": "GET", "path": "/api/elasticsearch/panel", "query": "panel=&es_pod=&idx_health=&idx_state=&idx_substring=&alloc_body=&index_pattern=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:9200 in ES pod" },
-      { "method": "POST", "path": "/api/elasticsearch/exec", "body": "{ path, method: GET, es_pod, confirmed? }", "auth": "session", "notes": "Custom GET path only; 409 if path not on allowlist" }
+      { "method": "POST", "path": "/api/elasticsearch/exec", "body": "{ path, method: GET, es_pod, confirmed? }", "auth": "session", "notes": "Custom GET path only; 409 if path not on allowlist" },
+      { "method": "GET", "path": "/api/k8s/logs/stream", "query": "workload=kafka|clickhouse|elasticsearch|postgresql|cassandra&pod=&container=", "auth": "session", "notes": "SSE text/event-stream; workload-specific pod/container allowlist" },
+      { "method": "GET", "path": "/api/postgres/panel", "query": "panel=tables&schema=clarisite_management|tenant_management&pg_pod=", "auth": "session", "notes": "Fixed SELECT via psql; requires .pg_password" },
+      { "method": "POST", "path": "/api/postgres/exec", "body": "{ sql, pg_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
+      { "method": "GET", "path": "/api/cassandra/panel", "query": "panel=keyspaces|desc_keyspace|tables&cass_pod=&keyspace=", "auth": "session", "notes": "Fixed read-only CQL via cqlsh" },
+      { "method": "POST", "path": "/api/cassandra/exec", "body": "{ cql, cass_pod, confirmed? }", "auth": "session", "notes": "409 when CQL not read-only and confirmed false" }
     ]
   },
   "kafka": {
@@ -60,5 +67,20 @@
     "kubectl_container_env": "GB_STS_ES_CONTAINER",
     "kubectl_container_default": "elasticsearch",
     "http_inside_pod": "http://127.0.0.1:9200"
+  },
+  "postgresql": {
+    "pod_prefixes": ["glassbox-postgresql-", "glassbox-postgresql-ha-postgresql-"],
+    "kubectl_container_env": "GB_STS_PG_CONTAINER",
+    "kubectl_container_default": "glassbox-postgresql",
+    "password_file": "data/sensitive/.pg_password",
+    "psql_user": "clarisite",
+    "psql_db": "glassbox"
+  },
+  "cassandra": {
+    "pod_prefix": "glassbox-cassandra-",
+    "kubectl_container_env": "GB_STS_CASS_CONTAINER",
+    "kubectl_container_default": "cassandra",
+    "cqlsh_operator_env": "GB_STS_CQLSH",
+    "cqlsh_notes": "Server resolves cqlsh: GB_STS_CQLSH if set, else /opt/bitnami/cassandra/bin/cqlsh and common paths, else PATH"
   }
 }

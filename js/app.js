@@ -11,8 +11,32 @@ const k8sAwsEl = document.getElementById("k8s-aws");
 const navKafka = document.getElementById("nav-kafka");
 const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
+const navPostgres = document.getElementById("nav-postgres");
+const navCassandra = document.getElementById("nav-cassandra");
 
-const VERSION = "1.0.14";
+const VERSION = "1.0.16";
+
+/** @type {Record<string, string> | null} */
+let workloadLogContainers = null;
+
+/** @type {{ controller: AbortController | null }} */
+const workloadLogStream = { controller: null };
+
+const WL_STACK_COMP = {
+  kafka: "kafka",
+  clickhouse: "clickhouse",
+  elasticsearch: "elasticsearch",
+  postgresql: "postgresql",
+  cassandra: "cassandra",
+};
+
+const WL_DEFAULT_POD = {
+  kafka: "glassbox-kafka-0",
+  clickhouse: "glassbox-clickhouse-0",
+  elasticsearch: "glassbox-elasticsearch-master-0",
+  postgresql: "glassbox-postgresql-0",
+  cassandra: "glassbox-cassandra-0",
+};
 
 /** @type {Array<Record<string, unknown>>} */
 let clustersList = [];
@@ -24,6 +48,257 @@ function esc(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function stopWorkloadLogStream() {
+  if (workloadLogStream.controller) {
+    workloadLogStream.controller.abort();
+    workloadLogStream.controller = null;
+  }
+}
+
+/**
+ * @param {string} rawLine
+ * @param {string} needle
+ */
+function logLineHtml(rawLine, needle) {
+  const n = (needle || "").trim();
+  if (!n) return esc(rawLine);
+  const out = [];
+  let i = 0;
+  const L = n.length;
+  while (i < rawLine.length) {
+    const j = rawLine.indexOf(n, i);
+    if (j < 0) {
+      out.push(esc(rawLine.slice(i)));
+      break;
+    }
+    out.push(esc(rawLine.slice(i, j)));
+    out.push(`<mark class="log-line-hit">${esc(n)}</mark>`);
+    i = j + L;
+  }
+  return out.join("");
+}
+
+/**
+ * @param {HTMLElement} outEl
+ * @param {string[]} rawLines
+ * @param {string} filterNeedle
+ */
+function redrawWorkloadLogDisplay(outEl, rawLines, filterNeedle) {
+  const q = (filterNeedle || "").trim();
+  const rows = [];
+  for (const ln of rawLines) {
+    if (q && !ln.includes(q)) continue;
+    rows.push(`<div class="log-line-row">${logLineHtml(ln, q)}</div>`);
+  }
+  outEl.innerHTML = rows.join("");
+}
+
+/**
+ * @param {string} workload
+ * @param {string} title
+ */
+function workloadLogsPanelHtml(workload, title) {
+  const idBase = `wl-${workload}`;
+  return `
+    <section class="panel panel--span-all kafka-logs-section" data-workload-logs="${esc(workload)}">
+      <div class="panel-head workload-logs-head">
+        <h2 id="${esc(idBase)}-title" class="workload-logs-h2">
+          <span class="workload-logs-title-text">${esc(title)}</span>
+          <label class="workload-logs-filter-label"><span>Filter</span>
+            <input type="text" class="text workload-logs-filter" id="${esc(idBase)}-filter" autocomplete="off" placeholder="substring…" />
+          </label>
+        </h2>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-primary wl-toggle" id="${esc(idBase)}-toggle">Activate</button>
+          <button type="button" class="btn wl-clear" id="${esc(idBase)}-clear">Clear</button>
+        </div>
+      </div>
+      <p class="muted">
+        Stream <code>kubectl logs</code> (<code>--tail 10</code>, <code>-f</code>). <strong>Deactivate</strong> stops the stream; leaving this page also stops it. <strong>Clear</strong> empties the buffer.
+      </p>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <label class="field field--inline">
+          <span>Pod</span>
+          <select class="text" id="${esc(idBase)}-pod" aria-label="Pod for logs"></select>
+        </label>
+        <label class="field field--inline">
+          <span>Container</span>
+          <select class="text" id="${esc(idBase)}-cont" aria-label="Container for logs"></select>
+        </label>
+      </div>
+      <div class="pre-copy-wrap kafka-logs-copy-wrap">
+        <button type="button" class="btn-copy" data-copy-target="${esc(idBase)}-out" title="Copy to clipboard" aria-label="Copy logs to clipboard"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button>
+        <div id="${esc(idBase)}-out" class="workload-logs-display kafka-logs-textarea" tabindex="0" role="log" aria-live="polite"></div>
+      </div>
+    </section>`;
+}
+
+/**
+ * @param {string} workload
+ */
+function workloadLogContainerDefault(workload) {
+  const w = workloadLogContainers && workloadLogContainers[workload];
+  if (typeof w === "string" && w) return w;
+  const fb = {
+    kafka: "kafka",
+    clickhouse: "glassbox-clickhouse",
+    elasticsearch: "elasticsearch",
+    postgresql: "glassbox-postgresql",
+    cassandra: "cassandra",
+  };
+  return fb[workload] || "kafka";
+}
+
+/**
+ * @param {HTMLSelectElement | null} sel
+ * @param {string} workload
+ */
+async function populateWorkloadLogPods(sel, workload) {
+  if (!sel) return;
+  const comp = WL_STACK_COMP[workload];
+  let stack = null;
+  try {
+    stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+  } catch {
+    stack = null;
+  }
+  if (!stack || !stack.components) {
+    try {
+      stack = await fetchJson("/api/k8s/stack");
+    } catch {
+      stack = null;
+    }
+  }
+  const pods = stack?.ok && comp && stack.components?.[comp]?.pods;
+  sel.innerHTML = "";
+  if (Array.isArray(pods) && pods.length > 0) {
+    const cap = workload === "kafka" ? 32 : 16;
+    for (const name of pods.slice(0, cap)) {
+      const o = document.createElement("option");
+      o.value = String(name);
+      o.textContent = String(name);
+      sel.appendChild(o);
+    }
+    return;
+  }
+  const def = WL_DEFAULT_POD[workload] || WL_DEFAULT_POD.kafka;
+  const o = document.createElement("option");
+  o.value = def;
+  o.textContent = def;
+  sel.appendChild(o);
+}
+
+/**
+ * @param {ParentNode} root
+ * @param {string} workload
+ */
+function wireWorkloadLogs(root, workload) {
+  const idBase = `wl-${workload}`;
+  const outEl = root.querySelector(`#${idBase}-out`);
+  const toggle = root.querySelector(`#${idBase}-toggle`);
+  const clearBtn = root.querySelector(`#${idBase}-clear`);
+  const podSel = root.querySelector(`#${idBase}-pod`);
+  const contSel = root.querySelector(`#${idBase}-cont`);
+  const filterInp = root.querySelector(`#${idBase}-filter`);
+  if (!(outEl instanceof HTMLElement) || !(toggle instanceof HTMLButtonElement)) return;
+
+  const contDef = workloadLogContainerDefault(workload);
+  if (contSel instanceof HTMLSelectElement) {
+    contSel.innerHTML = `<option value="${esc(contDef)}">${esc(contDef)}</option>`;
+  }
+
+  void populateWorkloadLogPods(podSel instanceof HTMLSelectElement ? podSel : null, workload);
+
+  /** @type {string[]} */
+  const rawLines = [];
+  const maxLines = 5000;
+
+  function redraw() {
+    const q = filterInp instanceof HTMLInputElement ? filterInp.value : "";
+    redrawWorkloadLogDisplay(outEl, rawLines, q);
+  }
+
+  filterInp?.addEventListener("input", () => redraw());
+
+  clearBtn?.addEventListener("click", () => {
+    rawLines.length = 0;
+    redraw();
+  });
+
+  async function runStream() {
+    if (workloadLogStream.controller) return;
+    function pushLine(line) {
+      rawLines.push(line);
+      while (rawLines.length > maxLines) rawLines.shift();
+    }
+    const pod = podSel instanceof HTMLSelectElement ? podSel.value : WL_DEFAULT_POD[workload];
+    const container = contSel instanceof HTMLSelectElement ? contSel.value : contDef;
+    const u = new URL("/api/k8s/logs/stream", location.origin);
+    u.searchParams.set("workload", workload);
+    u.searchParams.set("pod", pod);
+    u.searchParams.set("container", container);
+    const ac = new AbortController();
+    workloadLogStream.controller = ac;
+    toggle.textContent = "Deactivate";
+    try {
+      const r = await fetch(u.toString(), { credentials: "same-origin", signal: ac.signal });
+      if (!r.ok) {
+        const txt = await r.text();
+        pushLine(`[HTTP ${r.status}] ${txt.slice(0, 800)}`);
+        redraw();
+        return;
+      }
+      const reader = r.body?.getReader();
+      if (!reader) {
+        pushLine("[No response body]");
+        redraw();
+        return;
+      }
+      const dec = new TextDecoder();
+      let carry = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        carry += dec.decode(value, { stream: true });
+        let sep;
+        while ((sep = carry.indexOf("\n\n")) >= 0) {
+          const block = carry.slice(0, sep);
+          carry = carry.slice(sep + 2);
+          for (const ln of block.split("\n")) {
+            if (!ln.startsWith("data: ")) continue;
+            const raw = ln.slice(6);
+            try {
+              const o = JSON.parse(raw);
+              if (o.line != null) pushLine(String(o.line));
+            } catch {
+              pushLine(raw);
+            }
+          }
+          redraw();
+        }
+      }
+    } catch (e) {
+      if (e && /** @type {Error} */ (e).name !== "AbortError") {
+        pushLine(`[${String(/** @type {Error} */ (e).message || e)}]`);
+        redraw();
+      }
+    } finally {
+      if (workloadLogStream.controller === ac) workloadLogStream.controller = null;
+      toggle.textContent = "Activate";
+    }
+  }
+
+  toggle.addEventListener("click", () => {
+    if (workloadLogStream.controller) {
+      workloadLogStream.controller.abort();
+      return;
+    }
+    void runStream();
+  });
+
+  bindCopyButtons(root.querySelector(`[data-workload-logs="${workload}"]`) || root);
 }
 
 /** Rich HTML for ``panel-cmd-hint``: replace ``<T>`` / ``<G>`` with bold values when topic/group are set. */
@@ -131,10 +406,13 @@ async function refreshSessionUi() {
   try {
     const s = await fetchJson("/api/session/status");
     sessionVerified = !!s.verified;
+    workloadLogContainers = s.workload_log_containers && typeof s.workload_log_containers === "object" ? s.workload_log_containers : null;
     if (sessionVerified && s.session) {
       navKafka.hidden = false;
       if (navClickhouse) navClickhouse.hidden = false;
       if (navElasticsearch) navElasticsearch.hidden = false;
+      if (navPostgres) navPostgres.hidden = false;
+      if (navCassandra) navCassandra.hidden = false;
       const ap = s.session.p ? ` · AWS ${s.session.p}` : "";
       const reg = s.session.r ? ` · ${s.session.r}` : "";
       const cl = s.session.d ? ` · ${String(s.session.d).toUpperCase()}` : "";
@@ -143,6 +421,8 @@ async function refreshSessionUi() {
       navKafka.hidden = true;
       if (navClickhouse) navClickhouse.hidden = true;
       if (navElasticsearch) navElasticsearch.hidden = true;
+      if (navPostgres) navPostgres.hidden = true;
+      if (navCassandra) navCassandra.hidden = true;
       footerSession.textContent = "Session: not connected";
     }
   } catch {
@@ -150,6 +430,8 @@ async function refreshSessionUi() {
     navKafka.hidden = true;
     if (navClickhouse) navClickhouse.hidden = true;
     if (navElasticsearch) navElasticsearch.hidden = true;
+    if (navPostgres) navPostgres.hidden = true;
+    if (navCassandra) navCassandra.hidden = true;
     footerSession.textContent = "Session: unknown";
   }
 }
@@ -585,6 +867,7 @@ function renderHome() {
         <input class="text" id="namespace-hint" type="text" placeholder="default" autocomplete="off" />
       </label>
       <p class="hint" id="aws-profiles-meta"></p>
+      <ul id="aws-expiry-list" class="aws-expiry-list muted" hidden aria-label="AWS session expiry from credentials file"></ul>
       <p style="margin-top:1rem;">
         <button type="button" class="btn btn-primary" id="btn-verify">Connect &amp; verify</button>
         <button type="button" class="btn" id="btn-clear-session">Clear session</button>
@@ -623,6 +906,9 @@ function renderHome() {
     if (def.region) regionSel.value = def.region;
     try {
       const pr = await fetchJson("/api/aws/profiles");
+      const hints = /** @type {Record<string, { aws_expiration?: string, remaining_label?: string, expires_at_utc?: string }>} */ (
+        pr.session_hints || {}
+      );
       prSel.innerHTML = "";
       const optNone = document.createElement("option");
       optNone.value = "";
@@ -631,15 +917,45 @@ function renderHome() {
       for (const name of pr.profiles || []) {
         const o = document.createElement("option");
         o.value = name;
-        o.textContent = name;
+        const h = hints[name];
+        if (h && h.remaining_label) {
+          o.textContent = `${name} — ${h.remaining_label}`;
+          o.title = h.aws_expiration ? `aws_expiration ${h.aws_expiration}` : name;
+        } else {
+          o.textContent = name;
+        }
         prSel.appendChild(o);
       }
       const dprof = pr.default_profile || "glassbox_AWS_MT";
       if (def.aws_profile && (pr.profiles || []).includes(def.aws_profile)) prSel.value = def.aws_profile;
       else if ((pr.profiles || []).includes(dprof)) prSel.value = dprof;
-      metaEl.textContent = `AWS profiles: built-in list. Defaults file: data/sensitive/last_connected.json`;
+      const credPath = pr.meta?.credentials_path || "~/.aws/credentials";
+      metaEl.textContent = `AWS profiles: built-in list · session times from aws_expiration in ${credPath} · defaults: data/sensitive/last_connected.json`;
+      const expUl = document.getElementById("aws-expiry-list");
+      if (expUl) {
+        const entries = Object.keys(hints).sort((a, b) => a.localeCompare(b));
+        if (entries.length) {
+          expUl.hidden = false;
+          expUl.innerHTML = entries
+            .map((name) => {
+              const hi = hints[name];
+              const lab = hi?.remaining_label ? esc(String(hi.remaining_label)) : "";
+              const exp = hi?.aws_expiration ? esc(String(hi.aws_expiration)) : "";
+              return `<li><strong>${esc(name)}</strong> · ${lab}${exp ? ` · <code>${exp}</code>` : ""}</li>`;
+            })
+            .join("");
+        } else {
+          expUl.hidden = true;
+          expUl.innerHTML = "";
+        }
+      }
     } catch (e) {
       prSel.innerHTML = `<option value="">${esc(e.message || "profiles")}</option>`;
+      const expUl = document.getElementById("aws-expiry-list");
+      if (expUl) {
+        expUl.hidden = true;
+        expUl.innerHTML = "";
+      }
     }
     document.getElementById("namespace-hint").value = def.namespace || "";
     document.getElementById("cluster-typed").value = def.aws_cluster_name || "";
@@ -912,6 +1228,7 @@ function renderClickhouse() {
         </div>
       </div>
     </section>
+    ${workloadLogsPanelHtml("clickhouse", "ClickHouse logs")}
   `;
   const grid = app.querySelector("#ch-panels");
   /** @type {Array<[string, string, string, boolean, boolean]>} */
@@ -1025,6 +1342,7 @@ function renderClickhouse() {
     );
     if (ok) runChExec(true);
   });
+  wireWorkloadLogs(app, "clickhouse");
 }
 
 function appendElasticsearchToolbarParams(u) {
@@ -1162,6 +1480,7 @@ function renderElasticsearch() {
         </div>
       </div>
     </section>
+    ${workloadLogsPanelHtml("elasticsearch", "Elasticsearch logs")}
   `;
   const grid = app.querySelector("#es-panels");
   /** @type {Array<[string, string, string, boolean]>} */
@@ -1288,6 +1607,525 @@ function renderElasticsearch() {
     );
     if (ok) runEsExec(true);
   });
+  wireWorkloadLogs(app, "elasticsearch");
+}
+
+const PG_HISTORY_KEY = "gb_sts_pg_queries_v1";
+const CASS_HISTORY_KEY = "gb_sts_cassandra_queries_v1";
+
+/**
+ * @param {string} key
+ */
+function readRotatingQueries(key) {
+  try {
+    const a = JSON.parse(sessionStorage.getItem(key) || "[]");
+    return Array.isArray(a) ? a.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * @param {string} key
+ * @param {string} sql
+ */
+function pushRotatingQuery(key, sql, max = 10) {
+  const s = (sql || "").trim();
+  if (!s) return;
+  let arr = readRotatingQueries(key);
+  arr = arr.filter((x) => x !== s);
+  arr.push(s);
+  arr = arr.slice(-max);
+  sessionStorage.setItem(key, JSON.stringify(arr));
+}
+
+function renderPostgres() {
+  if (!sessionVerified) {
+    app.innerHTML =
+      "<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The PostgreSQL page requires a verified session.</div>";
+    return;
+  }
+  app.innerHTML = `
+    <p class="muted">
+      Default posture is <strong>read-only</strong>: fixed panels run approved <code>SELECT</code>s only.
+      <strong>Custom SQL</strong> is classified server-side; mutating statements require explicit confirmation.
+      Password for <code>psql -U clarisite -d glassbox</code> comes from <code>data/sensitive/.pg_password</code> (gitignored), same pattern as ClickHouse.
+      The default kubectl container name is <code>glassbox-postgresql</code>; for stock Bitnami charts use operator env <code>GB_STS_PG_CONTAINER=postgresql</code> when starting the tool server.
+    </p>
+    <section class="panel">
+      <h2>Pod</h2>
+      <p class="muted">Choose the PostgreSQL StatefulSet pod (stack probe lists non-HA and HA chart names).</p>
+      <label class="field">
+        <span>Pod</span>
+        <select class="text" id="pg-pod-select"></select>
+      </label>
+    </section>
+    <section class="panel">
+      <h2>Tables (information_schema)</h2>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <label class="field field--inline">
+          <span>Schema</span>
+          <select class="text" id="pg-schema">
+            <option value="clarisite_management">clarisite_management</option>
+            <option value="tenant_management">tenant_management</option>
+          </select>
+        </label>
+        <button type="button" class="btn btn-primary" id="pg-tables-refresh">Refresh</button>
+      </div>
+      <div id="pg-tables-out"><p class="muted">Click Refresh after choosing schema.</p></div>
+    </section>
+    <section class="panel exec-box">
+      <h2>Custom SQL</h2>
+      <p class="muted">Successful runs (return code 0, no <code>needs_confirmation</code> pending) rotate into the last-10 list for this browser tab.</p>
+      <p class="hint">Recent OK queries (newest first)</p>
+      <ul id="pg-query-history" class="query-history-list"></ul>
+      <textarea id="pg-exec-sql" spellcheck="false" rows="7" placeholder="SELECT current_database();"></textarea>
+      <p style="margin-top:0.75rem;">
+        <button type="button" class="btn btn-primary" id="pg-exec-run">Run</button>
+        <button type="button" class="btn btn-danger" id="pg-exec-run-confirmed" hidden>Run with confirmation</button>
+      </p>
+      <div id="pg-exec-out-wrap" class="exec-out-wrap" hidden>
+        <div id="pg-exec-out-inner"></div>
+        <div class="panel-output-footer">
+          <label class="exec-json-chk"><input type="checkbox" id="pg-exec-json" /> json</label>
+        </div>
+      </div>
+    </section>
+    ${workloadLogsPanelHtml("postgresql", "PostgreSQL logs")}
+  `;
+
+  function renderPgHistoryUi() {
+    const ul = document.getElementById("pg-query-history");
+    if (!ul) return;
+    const items = readRotatingQueries(PG_HISTORY_KEY).slice().reverse();
+    ul.innerHTML = items.length
+      ? items
+          .map(
+            (q) =>
+              `<li><button type="button" class="btn query-history-btn js-pg-hist" data-q="${esc(
+                encodeURIComponent(q),
+              )}">${esc(q.length > 140 ? `${q.slice(0, 140)}…` : q)}</button></li>`,
+          )
+          .join("")
+      : "<li class='muted'>(none yet)</li>";
+  }
+
+  (async () => {
+    let stack = null;
+    try {
+      stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+    } catch {
+      stack = null;
+    }
+    if (!stack?.components) {
+      try {
+        stack = await fetchJson("/api/k8s/stack");
+      } catch {
+        stack = null;
+      }
+    }
+    const sel = document.getElementById("pg-pod-select");
+    if (!sel) return;
+    const pods = stack?.components?.postgresql?.pods;
+    sel.innerHTML = "";
+    if (Array.isArray(pods) && pods.length) {
+      for (const name of pods.slice(0, 16)) {
+        const o = document.createElement("option");
+        o.value = String(name);
+        o.textContent = String(name);
+        sel.appendChild(o);
+      }
+    } else {
+      const o = document.createElement("option");
+      o.value = "glassbox-postgresql-0";
+      o.textContent = "glassbox-postgresql-0";
+      sel.appendChild(o);
+    }
+  })();
+
+  renderPgHistoryUi();
+  document.getElementById("pg-query-history")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-pg-hist");
+    if (!b) return;
+    const enc = b.getAttribute("data-q");
+    const ta = document.getElementById("pg-exec-sql");
+    if (enc && ta) {
+      try {
+        ta.value = decodeURIComponent(enc);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  async function loadPgTables() {
+    const out = document.getElementById("pg-tables-out");
+    const schema = document.getElementById("pg-schema")?.value ?? "clarisite_management";
+    const pg_pod = document.getElementById("pg-pod-select")?.value ?? "";
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    const u = new URL("/api/postgres/panel", location.origin);
+    u.searchParams.set("panel", "tables");
+    u.searchParams.set("schema", schema);
+    u.searchParams.set("pg_pod", pg_pod);
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      const d = e.detail || {};
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${kafkaPreWithWrapFooter(JSON.stringify(d, null, 2))}`;
+      bindCopyButtons(out);
+    }
+  }
+
+  document.getElementById("pg-tables-refresh")?.addEventListener("click", () => void loadPgTables());
+
+  const pgExecWrap = document.getElementById("pg-exec-out-wrap");
+  const pgExecInner = document.getElementById("pg-exec-out-inner");
+  const pgExecJson = document.getElementById("pg-exec-json");
+  const pgConfBtn = document.getElementById("pg-exec-run-confirmed");
+  /** @type {unknown} */
+  let lastPgExecPayload = null;
+
+  function renderPgExecOut(j) {
+    if (!pgExecInner) return;
+    const asJson = pgExecJson && pgExecJson.checked;
+    const text = asJson ? JSON.stringify(j, null, 2) : formatExecPlainHelper(j);
+    pgExecInner.innerHTML = kafkaPreWithWrapFooter(text);
+    bindCopyButtons(pgExecInner);
+  }
+
+  async function runPgExec(confirmed) {
+    const sql = document.getElementById("pg-exec-sql")?.value?.trim() ?? "";
+    const pg_pod = document.getElementById("pg-pod-select")?.value ?? "";
+    if (!pgExecWrap || !pgExecInner) return;
+    pgExecWrap.hidden = false;
+    pgExecInner.innerHTML = "<p class='muted'>Running…</p>";
+    if (pgConfBtn) pgConfBtn.hidden = true;
+    try {
+      const j = await fetchJson("/api/postgres/exec", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sql, pg_pod, confirmed }),
+      });
+      lastPgExecPayload = j;
+      if (j.needs_confirmation) {
+        renderPgExecOut(j);
+        if (pgConfBtn) pgConfBtn.hidden = false;
+        return;
+      }
+      renderPgExecOut(j);
+      if (j.ok && sql) {
+        pushRotatingQuery(PG_HISTORY_KEY, sql);
+        renderPgHistoryUi();
+      }
+    } catch (e) {
+      const payload = e.detail || { error: e.message };
+      lastPgExecPayload = payload;
+      if (e.status === 409 && e.detail && e.detail.needs_confirmation) {
+        renderPgExecOut(e.detail);
+        if (pgConfBtn) pgConfBtn.hidden = false;
+        return;
+      }
+      renderPgExecOut(payload);
+    }
+  }
+
+  pgExecJson?.addEventListener("change", () => {
+    if (lastPgExecPayload != null) renderPgExecOut(lastPgExecPayload);
+  });
+  document.getElementById("pg-exec-run")?.addEventListener("click", () => void runPgExec(false));
+  document.getElementById("pg-exec-run-confirmed")?.addEventListener("click", () => {
+    const ok = window.confirm(
+      "The server flagged this SQL as potentially write-oriented.\n\nRun it anyway? Only proceed if you intend to mutate PostgreSQL data.",
+    );
+    if (ok) void runPgExec(true);
+  });
+  wireWorkloadLogs(app, "postgresql");
+}
+
+function renderCassandra() {
+  if (!sessionVerified) {
+    app.innerHTML =
+      "<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The Cassandra page requires a verified session.</div>";
+    return;
+  }
+  app.innerHTML = `
+    <p class="muted">
+      Read-only by default: keyspace / table panels run fixed <code>DESCRIBE</code> / <code>SELECT</code> statements.
+      <strong>Custom CQL</strong> is restricted and vetted server-side; writes require confirmation.
+      The server looks for <code>cqlsh</code> under typical paths (e.g. Bitnami <code>/opt/bitnami/cassandra/bin/cqlsh</code>) before <code>PATH</code>.
+      If your image stores it elsewhere, set operator env <code>GB_STS_CQLSH</code> to the <strong>in-pod</strong> absolute path before starting <code>server.py</code>.
+    </p>
+    <section class="panel">
+      <h2>Pod</h2>
+      <label class="field">
+        <span>Pod</span>
+        <select class="text" id="cass-pod-select"></select>
+      </label>
+    </section>
+    <section class="panel">
+      <h2>Keyspaces</h2>
+      <button type="button" class="btn btn-primary" id="cass-keyspaces-refresh">Refresh</button>
+      <div id="cass-keyspaces-out" style="margin-top:0.75rem;"><p class="muted">Click Refresh for <code>DESCRIBE KEYSPACES</code>.</p></div>
+    </section>
+    <section class="panel">
+      <h2>Describe keyspace</h2>
+      <label class="field">
+        <span>Keyspace name</span>
+        <input class="text" id="cass-desc-ks" type="text" placeholder="glassbox" autocomplete="off" />
+      </label>
+      <p style="margin-top:0.75rem;"><button type="button" class="btn btn-primary" id="cass-desc-refresh">Describe</button></p>
+      <div id="cass-desc-out"><p class="muted">Output appears here.</p></div>
+    </section>
+    <section class="panel">
+      <h2>Tables in keyspace</h2>
+      <label class="field">
+        <span>Keyspace name</span>
+        <input class="text" id="cass-tables-ks" type="text" placeholder="glassbox" autocomplete="off" />
+      </label>
+      <p style="margin-top:0.75rem;"><button type="button" class="btn btn-primary" id="cass-tables-refresh">List tables</button></p>
+      <div id="cass-tables-out"><p class="muted">Runs <code>SELECT table_name FROM system_schema.tables …</code></p></div>
+    </section>
+    <section class="panel exec-box">
+      <h2>Custom CQL</h2>
+      <p class="muted">Last 10 successful statements (exit 0) are kept in <code>sessionStorage</code> for this tab.</p>
+      <p class="hint">Recent OK CQL (newest first)</p>
+      <ul id="cass-query-history" class="query-history-list"></ul>
+      <textarea id="cass-exec-cql" spellcheck="false" rows="7" placeholder="DESCRIBE KEYSPACES;"></textarea>
+      <p style="margin-top:0.75rem;">
+        <button type="button" class="btn btn-primary" id="cass-exec-run">Run</button>
+        <button type="button" class="btn btn-danger" id="cass-exec-run-confirmed" hidden>Run with confirmation</button>
+      </p>
+      <div id="cass-exec-out-wrap" class="exec-out-wrap" hidden>
+        <div id="cass-exec-out-inner"></div>
+        <div class="panel-output-footer">
+          <label class="exec-json-chk"><input type="checkbox" id="cass-exec-json" /> json</label>
+        </div>
+      </div>
+    </section>
+    ${workloadLogsPanelHtml("cassandra", "Cassandra logs")}
+  `;
+
+  function renderCassHistoryUi() {
+    const ul = document.getElementById("cass-query-history");
+    if (!ul) return;
+    const items = readRotatingQueries(CASS_HISTORY_KEY).slice().reverse();
+    ul.innerHTML = items.length
+      ? items
+          .map(
+            (q) =>
+              `<li><button type="button" class="btn query-history-btn js-cass-hist" data-q="${esc(
+                encodeURIComponent(q),
+              )}">${esc(q.length > 140 ? `${q.slice(0, 140)}…` : q)}</button></li>`,
+          )
+          .join("")
+      : "<li class='muted'>(none yet)</li>";
+  }
+
+  (async () => {
+    let stack = null;
+    try {
+      stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+    } catch {
+      stack = null;
+    }
+    if (!stack?.components) {
+      try {
+        stack = await fetchJson("/api/k8s/stack");
+      } catch {
+        stack = null;
+      }
+    }
+    const sel = document.getElementById("cass-pod-select");
+    if (!sel) return;
+    const pods = stack?.components?.cassandra?.pods;
+    sel.innerHTML = "";
+    if (Array.isArray(pods) && pods.length) {
+      for (const name of pods.slice(0, 16)) {
+        const o = document.createElement("option");
+        o.value = String(name);
+        o.textContent = String(name);
+        sel.appendChild(o);
+      }
+    } else {
+      const o = document.createElement("option");
+      o.value = "glassbox-cassandra-0";
+      o.textContent = "glassbox-cassandra-0";
+      sel.appendChild(o);
+    }
+  })();
+
+  renderCassHistoryUi();
+  document.getElementById("cass-query-history")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-cass-hist");
+    if (!b) return;
+    const enc = b.getAttribute("data-q");
+    const ta = document.getElementById("cass-exec-cql");
+    if (enc && ta) {
+      try {
+        ta.value = decodeURIComponent(enc);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  function cassPod() {
+    return document.getElementById("cass-pod-select")?.value ?? "";
+  }
+
+  async function loadCassPanel(panel, extra = {}) {
+    const u = new URL("/api/cassandra/panel", location.origin);
+    u.searchParams.set("panel", panel);
+    u.searchParams.set("cass_pod", cassPod());
+    if (extra.keyspace) u.searchParams.set("keyspace", extra.keyspace);
+    return fetchJson(u.toString());
+  }
+
+  document.getElementById("cass-keyspaces-refresh")?.addEventListener("click", async () => {
+    const out = document.getElementById("cass-keyspaces-out");
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadCassPanel("keyspaces");
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>${esc(String(j.cql_executed || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  });
+
+  document.getElementById("cass-desc-refresh")?.addEventListener("click", async () => {
+    const out = document.getElementById("cass-desc-out");
+    const ks = document.getElementById("cass-desc-ks")?.value?.trim() ?? "";
+    if (!out) return;
+    if (!ks) {
+      out.innerHTML = "<p class='status-bad'>Enter a keyspace name.</p>";
+      return;
+    }
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadCassPanel("desc_keyspace", { keyspace: ks });
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>${esc(String(j.cql_executed || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  });
+
+  document.getElementById("cass-tables-refresh")?.addEventListener("click", async () => {
+    const out = document.getElementById("cass-tables-out");
+    const ks = document.getElementById("cass-tables-ks")?.value?.trim() ?? "";
+    if (!out) return;
+    if (!ks) {
+      out.innerHTML = "<p class='status-bad'>Enter a keyspace name.</p>";
+      return;
+    }
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadCassPanel("tables", { keyspace: ks });
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>${esc(String(j.cql_executed || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  });
+
+  const cassExecWrap = document.getElementById("cass-exec-out-wrap");
+  const cassExecInner = document.getElementById("cass-exec-out-inner");
+  const cassExecJson = document.getElementById("cass-exec-json");
+  const cassConfBtn = document.getElementById("cass-exec-run-confirmed");
+  /** @type {unknown} */
+  let lastCassExecPayload = null;
+
+  function renderCassExecOut(j) {
+    if (!cassExecInner) return;
+    const asJson = cassExecJson && cassExecJson.checked;
+    const text = asJson ? JSON.stringify(j, null, 2) : formatExecPlainHelper(j);
+    cassExecInner.innerHTML = kafkaPreWithWrapFooter(text);
+    bindCopyButtons(cassExecInner);
+  }
+
+  async function runCassExec(confirmed) {
+    const cql = document.getElementById("cass-exec-cql")?.value?.trim() ?? "";
+    if (!cassExecWrap || !cassExecInner) return;
+    cassExecWrap.hidden = false;
+    cassExecInner.innerHTML = "<p class='muted'>Running…</p>";
+    if (cassConfBtn) cassConfBtn.hidden = true;
+    try {
+      const j = await fetchJson("/api/cassandra/exec", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cql, cass_pod: cassPod(), confirmed }),
+      });
+      lastCassExecPayload = j;
+      if (j.needs_confirmation) {
+        renderCassExecOut(j);
+        if (cassConfBtn) cassConfBtn.hidden = false;
+        return;
+      }
+      renderCassExecOut(j);
+      if (j.ok && cql) {
+        pushRotatingQuery(CASS_HISTORY_KEY, cql);
+        renderCassHistoryUi();
+      }
+    } catch (e) {
+      const payload = e.detail || { error: e.message };
+      lastCassExecPayload = payload;
+      if (e.status === 409 && e.detail && e.detail.needs_confirmation) {
+        renderCassExecOut(e.detail);
+        if (cassConfBtn) cassConfBtn.hidden = false;
+        return;
+      }
+      renderCassExecOut(payload);
+    }
+  }
+
+  cassExecJson?.addEventListener("change", () => {
+    if (lastCassExecPayload != null) renderCassExecOut(lastCassExecPayload);
+  });
+  document.getElementById("cass-exec-run")?.addEventListener("click", () => void runCassExec(false));
+  document.getElementById("cass-exec-run-confirmed")?.addEventListener("click", () => {
+    const ok = window.confirm(
+      "The server flagged this CQL as potentially write-oriented.\n\nRun it anyway? Only proceed if you intend to mutate Cassandra data.",
+    );
+    if (ok) void runCassExec(true);
+  });
+  wireWorkloadLogs(app, "cassandra");
 }
 
 function renderKafka() {
@@ -1347,34 +2185,7 @@ function renderKafka() {
       <div id="rebalance-commands" hidden></div>
     </section>
 
-    <section class="panel panel--span-all kafka-rebalance-section kafka-logs-section" aria-labelledby="kafka-logs-title">
-      <div class="panel-head">
-        <h2 id="kafka-logs-title">Kafka logs</h2>
-        <div class="panel-actions">
-          <button type="button" class="btn btn-primary" id="kafka-logs-toggle-btn">Activate</button>
-          <button type="button" class="btn" id="kafka-logs-clear-btn">Clear</button>
-        </div>
-      </div>
-      <p class="muted">
-        Stream <code>kubectl logs</code> from a Kafka StatefulSet pod (<code>--tail 10</code>, <code>-f</code> follow). <strong>Deactivate</strong> stops the stream; <strong>Clear</strong> only empties the text area.
-      </p>
-      <div class="panel-toolbar kafka-logs-toolbar">
-        <label class="field field--inline">
-          <span>Pod</span>
-          <select class="text" id="kafka-logs-pod" aria-label="Kafka pod"></select>
-        </label>
-        <label class="field field--inline">
-          <span>Container</span>
-          <select class="text" id="kafka-logs-container" aria-label="Container name">
-            <option value="kafka">kafka</option>
-          </select>
-        </label>
-      </div>
-      <div class="pre-copy-wrap kafka-logs-copy-wrap">
-        <button type="button" class="btn-copy" data-copy-target="kafka-logs-out" title="Copy to clipboard" aria-label="Copy logs to clipboard"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button>
-        <textarea id="kafka-logs-out" class="kafka-logs-textarea" spellcheck="false" readonly rows="12" aria-label="Kafka log output"></textarea>
-      </div>
-    </section>
+    ${workloadLogsPanelHtml("kafka", "Kafka logs")}
 
     <section class="panel exec-box">
       <h2>Custom command (broker shell)</h2>
@@ -1663,114 +2474,7 @@ ${preWithCopy(c3)}`;
   wireKafkaRows(gridTopics, topicPanels);
   wireKafkaRows(gridGroups, [...groupPanelsLeft, ...groupPanelsRight, ...groupPanelsLag]);
 
-  (async () => {
-    let stack = null;
-    try {
-      stack = await fetchJson("/api/k8s/stack");
-    } catch {
-      stack = null;
-    }
-    const sel = document.getElementById("kafka-logs-pod");
-    if (!sel) return;
-    const kc = stack?.ok && stack.components?.kafka ? stack.components.kafka : null;
-    const pods = kc?.pods;
-    sel.innerHTML = "";
-    if (Array.isArray(pods) && pods.length > 0) {
-      for (const name of pods.slice(0, 32)) {
-        const o = document.createElement("option");
-        o.value = String(name);
-        o.textContent = String(name);
-        sel.appendChild(o);
-      }
-    } else {
-      const rep = Number(kc?.replicas);
-      const n = Number.isFinite(rep) && rep > 0 ? Math.min(32, Math.floor(rep)) : 1;
-      for (let i = 0; i < n; i++) {
-        const o = document.createElement("option");
-        o.value = `glassbox-kafka-${i}`;
-        o.textContent = `glassbox-kafka-${i}`;
-        sel.appendChild(o);
-      }
-    }
-  })();
-
-  bindCopyButtons(app.querySelector(".kafka-logs-section") || app);
-
-  const kafkaLogsTa = document.getElementById("kafka-logs-out");
-  const kafkaLogsBtn = document.getElementById("kafka-logs-toggle-btn");
-  const kafkaLogsClear = document.getElementById("kafka-logs-clear-btn");
-  /** @type {AbortController | null} */
-  let kafkaLogsAbort = null;
-
-  function kafkaLogsStopUi() {
-    kafkaLogsAbort = null;
-    if (kafkaLogsBtn) kafkaLogsBtn.textContent = "Activate";
-  }
-
-  async function kafkaLogsRunStream() {
-    if (!kafkaLogsTa || !kafkaLogsBtn) return;
-    if (kafkaLogsAbort) return;
-    const pod = document.getElementById("kafka-logs-pod")?.value ?? "glassbox-kafka-0";
-    const container = document.getElementById("kafka-logs-container")?.value ?? "kafka";
-    const u = new URL("/api/kafka/logs/stream", location.origin);
-    u.searchParams.set("pod", pod);
-    u.searchParams.set("container", container);
-    kafkaLogsAbort = new AbortController();
-    kafkaLogsBtn.textContent = "Deactivate";
-    try {
-      const r = await fetch(u.toString(), { credentials: "same-origin", signal: kafkaLogsAbort.signal });
-      if (!r.ok) {
-        const txt = await r.text();
-        kafkaLogsTa.value += `\n[HTTP ${r.status}] ${txt.slice(0, 800)}\n`;
-        return;
-      }
-      const reader = r.body?.getReader();
-      if (!reader) {
-        kafkaLogsTa.value += "\n[No response body]\n";
-        return;
-      }
-      const dec = new TextDecoder();
-      let carry = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        carry += dec.decode(value, { stream: true });
-        let sep;
-        while ((sep = carry.indexOf("\n\n")) >= 0) {
-          const block = carry.slice(0, sep);
-          carry = carry.slice(sep + 2);
-          for (const ln of block.split("\n")) {
-            if (!ln.startsWith("data: ")) continue;
-            const raw = ln.slice(6);
-            try {
-              const o = JSON.parse(raw);
-              if (o.line != null) kafkaLogsTa.value += `${o.line}\n`;
-            } catch {
-              kafkaLogsTa.value += `${raw}\n`;
-            }
-          }
-        }
-      }
-    } catch (e) {
-      if (e && /** @type {Error} */ (e).name !== "AbortError" && kafkaLogsTa) {
-        kafkaLogsTa.value += `\n[${String(/** @type {Error} */ (e).message || e)}]\n`;
-      }
-    } finally {
-      kafkaLogsStopUi();
-    }
-  }
-
-  kafkaLogsBtn?.addEventListener("click", () => {
-    if (kafkaLogsAbort) {
-      kafkaLogsAbort.abort();
-      return;
-    }
-    void kafkaLogsRunStream();
-  });
-
-  kafkaLogsClear?.addEventListener("click", () => {
-    if (kafkaLogsTa) kafkaLogsTa.value = "";
-  });
+  wireWorkloadLogs(app, "kafka");
 
   const execWrap = app.querySelector("#exec-out-wrap");
   const execInner = app.querySelector("#exec-out-inner");
@@ -1839,6 +2543,7 @@ ${preWithCopy(c3)}`;
 }
 
 function route() {
+  stopWorkloadLogStream();
   setActiveNav();
   const h = location.hash || "#/";
   if (h.startsWith("#/kafka")) {
@@ -1847,6 +2552,10 @@ function route() {
     renderClickhouse();
   } else if (h.startsWith("#/elasticsearch")) {
     renderElasticsearch();
+  } else if (h.startsWith("#/postgres")) {
+    renderPostgres();
+  } else if (h.startsWith("#/cassandra")) {
+    renderCassandra();
   } else {
     renderHome();
   }

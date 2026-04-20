@@ -24,6 +24,10 @@ ELASTICSEARCH_POD_PREFIX = "glassbox-elasticsearch-master-"
 ELASTICSEARCH_CONTAINER = os.environ.get("GB_STS_ES_CONTAINER", "elasticsearch").strip() or "elasticsearch"
 ELASTICSEARCH_LOCAL = "http://127.0.0.1:9200"
 
+# Glassbox chart uses this container name (Bitnami chart default is often ``postgresql``).
+POSTGRES_CONTAINER = os.environ.get("GB_STS_PG_CONTAINER", "glassbox-postgresql").strip() or "glassbox-postgresql"
+CASSANDRA_CONTAINER = os.environ.get("GB_STS_CASS_CONTAINER", "cassandra").strip() or "cassandra"
+
 # Commands that must never run without an explicit user confirmation flag.
 _WRITE_MARKERS = (
     "--delete",
@@ -61,6 +65,64 @@ def sanitize_kafka_logs_pod(pod: str) -> str | None:
 def sanitize_kafka_logs_container(container: str) -> str | None:
     c = (container or "").strip()
     if c == KAFKA_CONTAINER:
+        return c
+    return None
+
+
+_LOG_WORKLOADS = frozenset({"kafka", "clickhouse", "elasticsearch", "postgresql", "cassandra"})
+_CH_LOG_POD = re.compile(r"^glassbox-clickhouse-(\d+)$")
+_ES_LOG_POD = re.compile(r"^glassbox-elasticsearch-master-(\d+)$")
+_PG_LOG_SINGLE = re.compile(r"^glassbox-postgresql-(\d+)$")
+_PG_LOG_HA = re.compile(r"^glassbox-postgresql-ha-postgresql-(\d+)$")
+_CASS_LOG_POD = re.compile(r"^glassbox-cassandra-(\d+)$")
+
+
+def sanitize_pod_for_workload(workload: str, pod: str) -> str | None:
+    """Strict pod names for kubectl logs/exec (must match stack chart naming)."""
+    w = (workload or "").strip().lower()
+    p = (pod or "").strip()
+    if w == "kafka":
+        return sanitize_kafka_logs_pod(p)
+    if w == "clickhouse":
+        m = _CH_LOG_POD.match(p)
+        if not m:
+            return None
+        i = int(m.group(1))
+        return p if 0 <= i <= 31 else None
+    if w == "elasticsearch":
+        m = _ES_LOG_POD.match(p)
+        if not m:
+            return None
+        i = int(m.group(1))
+        return p if 0 <= i <= 31 else None
+    if w == "postgresql":
+        for rx in (_PG_LOG_SINGLE, _PG_LOG_HA):
+            m = rx.match(p)
+            if m:
+                i = int(m.group(1))
+                return p if 0 <= i <= 31 else None
+        return None
+    if w == "cassandra":
+        m = _CASS_LOG_POD.match(p)
+        if not m:
+            return None
+        i = int(m.group(1))
+        return p if 0 <= i <= 31 else None
+    return None
+
+
+def sanitize_workload_logs_container(workload: str, container: str) -> str | None:
+    w = (workload or "").strip().lower()
+    c = (container or "").strip()
+    if w == "kafka" and c == KAFKA_CONTAINER:
+        return c
+    if w == "clickhouse" and c == CLICKHOUSE_CONTAINER:
+        return c
+    if w == "elasticsearch" and c == ELASTICSEARCH_CONTAINER:
+        return c
+    if w == "postgresql" and c == POSTGRES_CONTAINER:
+        return c
+    if w == "cassandra" and c == CASSANDRA_CONTAINER:
         return c
     return None
 
@@ -438,6 +500,89 @@ def clickhouse_client_query(
         inner,
     ]
     return _run(argv, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
+
+
+def pod_bash_lc_exec(
+    namespace: str,
+    pod_name: str,
+    container: str,
+    inner_bash_lc: str,
+    timeout: int = 180,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+) -> CmdResult:
+    """Run ``bash -lc <inner>`` inside an arbitrary pod container (operator-controlled commands only)."""
+    argv = [
+        "kubectl",
+        "exec",
+        "-n",
+        namespace,
+        "-c",
+        container,
+        pod_name,
+        "--",
+        "bash",
+        "-lc",
+        inner_bash_lc,
+    ]
+    return _run(argv, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
+
+
+def postgres_psql_query(
+    namespace: str,
+    pod_name: str,
+    container: str,
+    password: str,
+    sql: str,
+    timeout: int = 180,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+) -> CmdResult:
+    """Run psql -c with password from env (SQL via base64, same pattern as ClickHouse)."""
+    pw = shlex.quote(password)
+    b64 = base64.b64encode((sql or "").encode("utf-8")).decode("ascii")
+    b64q = shlex.quote(b64)
+    inner = (
+        f"decoded=$(echo {b64q} | base64 -d) && export PGPASSWORD={pw} && "
+        'psql -U clarisite -d glassbox -t -A -v ON_ERROR_STOP=1 -c "$decoded"'
+    )
+    return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
+
+
+def cassandra_cqlsh_query(
+    namespace: str,
+    pod_name: str,
+    container: str,
+    cql: str,
+    timeout: int = 180,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+) -> CmdResult:
+    """
+    Run ``cqlsh -e`` with CQL via base64 (localhost in-pod).
+
+    ``kubectl exec`` often uses a minimal PATH; Bitnami images ship cqlsh under
+    ``/opt/bitnami/cassandra/bin/``. Override with env ``GB_STS_CQLSH`` (full path on the pod).
+    """
+    b64 = base64.b64encode((cql or "").encode("utf-8")).decode("ascii")
+    b64q = shlex.quote(b64)
+    explicit = os.environ.get("GB_STS_CQLSH", "").strip()
+    if explicit:
+        qbin = shlex.quote(explicit)
+        inner = f"decoded=$(echo {b64q} | base64 -d) && {qbin} -e \"$decoded\""
+    else:
+        inner = (
+            f"decoded=$(echo {b64q} | base64 -d) && "
+            "CQLSH=\"\"; "
+            "for p in /opt/bitnami/cassandra/bin/cqlsh /opt/apache-cassandra/bin/cqlsh "
+            "/usr/bin/cqlsh /usr/local/bin/cqlsh; do "
+            "  if [ -x \"$p\" ]; then CQLSH=\"$p\"; break; fi; "
+            "done; "
+            "if [ -z \"$CQLSH\" ] && command -v cqlsh >/dev/null 2>&1; then CQLSH=$(command -v cqlsh); fi; "
+            "if [ -z \"$CQLSH\" ]; then echo \"cqlsh not found (set GB_STS_CQLSH to the in-pod path, then restart server.py)\" >&2; exit 127; fi; "
+            '"$CQLSH" -e "$decoded"'
+        )
+    return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
 
 
 def kafka_bash_exec(

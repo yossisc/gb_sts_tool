@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Glassbox STS tool — local web UI for read-only Kafka / ClickHouse / Elasticsearch diagnostics via kubectl exec.
+Glassbox STS tool — local web UI for read-only Kafka / ClickHouse / Elasticsearch / PostgreSQL / Cassandra diagnostics via kubectl exec.
 
 Run: ./run
 Open: http://127.0.0.1:<port>/
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.14"
+VERSION = "1.0.16"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -36,9 +36,18 @@ from backend import k8s_exec as kx  # noqa: E402
 from backend import regions as reg  # noqa: E402
 from backend import sensitive_store as sens  # noqa: E402
 from backend import session as sess  # noqa: E402
+from backend import pg_cassandra as pgc  # noqa: E402
 from backend import stack_components as stack  # noqa: E402
 
 _httpd: ThreadingHTTPServer | None = None
+
+_LOG_DEFAULT_CONT: dict[str, str] = {
+    "kafka": kx.KAFKA_CONTAINER,
+    "clickhouse": kx.CLICKHOUSE_CONTAINER,
+    "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
+    "postgresql": kx.POSTGRES_CONTAINER,
+    "cassandra": kx.CASSANDRA_CONTAINER,
+}
 
 
 def _bind_host() -> str:
@@ -328,24 +337,38 @@ def _sse_write_chunk(wfile, obj: object) -> bool:
         return False
 
 
-def _kafka_logs_stream(handler: SimpleHTTPRequestHandler, qs: dict[str, list[str]]) -> None:
+def _workload_logs_stream(
+    handler: SimpleHTTPRequestHandler, qs: dict[str, list[str]], *, default_workload: str | None
+) -> None:
     s = _session_from(handler)
     if not s:
         handler._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
         return
-    pod_raw = (qs.get("pod") or [""])[0].strip()
-    cont_raw = (qs.get("container") or [kx.KAFKA_CONTAINER])[0].strip()
-    pod_name = kx.sanitize_kafka_logs_pod(pod_raw)
-    if not pod_name:
+    workload_raw = (qs.get("workload") or ([default_workload] if default_workload else [""]))[0].strip().lower()
+    if workload_raw not in _LOG_DEFAULT_CONT:
         handler._json(
-            {"ok": False, "error": "Invalid pod (expected glassbox-kafka-0 … glassbox-kafka-31)."},
+            {
+                "ok": False,
+                "error": "Missing or invalid workload (use kafka, clickhouse, elasticsearch, postgresql, cassandra).",
+            },
             HTTPStatus.BAD_REQUEST,
         )
         return
-    container = kx.sanitize_kafka_logs_container(cont_raw)
+    workload = workload_raw
+    pod_raw = (qs.get("pod") or [""])[0].strip()
+    def_cont = _LOG_DEFAULT_CONT[workload]
+    cont_raw = (qs.get("container") or [def_cont])[0].strip()
+    pod_name = kx.sanitize_pod_for_workload(workload, pod_raw)
+    if not pod_name:
+        handler._json(
+            {"ok": False, "error": f"Invalid pod for workload {workload!r}."},
+            HTTPStatus.BAD_REQUEST,
+        )
+        return
+    container = kx.sanitize_workload_logs_container(workload, cont_raw)
     if not container:
         handler._json(
-            {"ok": False, "error": f"Invalid container (only {kx.KAFKA_CONTAINER!r} is allowed)."},
+            {"ok": False, "error": f"Invalid container for workload {workload!r} (expected {def_cont!r})."},
             HTTPStatus.BAD_REQUEST,
         )
         return
@@ -516,15 +539,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/aws/profiles":
-            profiles, meta = aws_profiles.list_profiles()
-            self._json(
-                {
-                    "ok": True,
-                    "profiles": profiles,
-                    "default_profile": aws_profiles.AWS_PROFILE_DEFAULT,
-                    "meta": meta,
-                }
-            )
+            self._json(aws_profiles.profiles_api_payload())
             return
 
         if path == "/api/k8s/defaults":
@@ -560,6 +575,14 @@ class Handler(SimpleHTTPRequestHandler):
                 "aws_profile": ap,
                 "cloud": cl,
                 "clickhouse_password_configured": bool(sens.read_clickhouse_password()),
+                "postgres_password_configured": bool(sens.read_postgres_password()),
+                "workload_log_containers": {
+                    "kafka": kx.KAFKA_CONTAINER,
+                    "clickhouse": kx.CLICKHOUSE_CONTAINER,
+                    "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
+                    "postgresql": kx.POSTGRES_CONTAINER,
+                    "cassandra": kx.CASSANDRA_CONTAINER,
+                },
             })
             return
 
@@ -704,7 +727,108 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/kafka/logs/stream":
-            _kafka_logs_stream(self, qs)
+            _workload_logs_stream(self, qs, default_workload="kafka")
+            return
+
+        if path == "/api/k8s/logs/stream":
+            _workload_logs_stream(self, qs, default_workload=None)
+            return
+
+        if path == "/api/postgres/panel":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+                return
+            pw = sens.read_postgres_password()
+            if not pw:
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "PostgreSQL password file missing.",
+                        "hint": "Create data/sensitive/.pg_password (single line, PGPASSWORD for user clarisite).",
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            panel = (qs.get("panel") or [""])[0].strip()
+            pg_pod = (qs.get("pg_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("postgresql", pg_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid pg_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            if panel == "tables":
+                try:
+                    schema = pgc.sanitize_postgres_schema((qs.get("schema") or ["clarisite_management"])[0])
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+                sql = pgc.postgres_tables_sql(schema)
+                r = kx.postgres_psql_query(
+                    ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=120, aws_profile=ap, cloud=cl
+                )
+                self._json(
+                    {
+                        "ok": r.ok,
+                        "panel": panel,
+                        "schema": schema,
+                        "stdout": kx.tail_lines(r.stdout, 8000),
+                        "stderr": kx.filter_kubectl_noise(r.stderr),
+                        "returncode": r.returncode,
+                        "cmd_display": r.cmd_display,
+                        "pod": pod_name,
+                    }
+                )
+                return
+            self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if path == "/api/cassandra/panel":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+                return
+            panel = (qs.get("panel") or [""])[0].strip()
+            cass_pod = (qs.get("cass_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("cassandra", cass_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid cass_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            if panel == "keyspaces":
+                cql = pgc.cassandra_keyspaces_cql()
+            elif panel == "desc_keyspace":
+                try:
+                    cql = pgc.cassandra_desc_keyspace_cql((qs.get("keyspace") or [""])[0])
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+            elif panel == "tables":
+                try:
+                    cql = pgc.cassandra_tables_cql((qs.get("keyspace") or [""])[0])
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+            else:
+                self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
+                return
+            r = kx.cassandra_cqlsh_query(ns, pod_name, kx.CASSANDRA_CONTAINER, cql, timeout=120, aws_profile=ap, cloud=cl)
+            self._json(
+                {
+                    "ok": r.ok,
+                    "panel": panel,
+                    "stdout": kx.tail_lines(r.stdout, 8000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                    "cql_executed": cql,
+                }
+            )
             return
 
         if path == "/api/kafka/panel":
@@ -1082,6 +1206,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "pod_line": (pod.stdout or "").strip()[:2000],
                     "stack": stack_info,
                     "clickhouse_password_configured": bool(sens.read_clickhouse_password()),
+                    "postgres_password_configured": bool(sens.read_postgres_password()),
                 },
                 extra_headers=[("Set-Cookie", self._session_cookie_header(token))],
             )
@@ -1144,6 +1269,111 @@ class Handler(SimpleHTTPRequestHandler):
                 timeout=300,
                 aws_profile=ap,
                 cloud=cl,
+            )
+            self._json(
+                {
+                    "ok": r.ok,
+                    "stdout": kx.tail_lines(r.stdout, 12000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                }
+            )
+            return
+
+        if path == "/api/postgres/exec":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            pw = sens.read_postgres_password()
+            if not pw:
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "PostgreSQL password file missing.",
+                        "hint": "Create data/sensitive/.pg_password (single line).",
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            sql = str(body.get("sql") or "").strip()
+            confirmed = bool(body.get("confirmed"))
+            ro, reason = pgc.classify_postgres_sql(sql)
+            if not ro and not confirmed:
+                self._json(
+                    {
+                        "ok": False,
+                        "needs_confirmation": True,
+                        "reason": reason or "non-read-only",
+                        "message": "This SQL may write or mutate data. Submit again with confirmed: true after approval.",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            if not ro and confirmed:
+                low = sql.lower()
+                if any(x in low for x in ("rm -rf", ";--", "into outfile", "copy (program", "lo_import", "lo_export")):
+                    self._json({"ok": False, "error": "SQL blocked even after confirmation."}, HTTPStatus.FORBIDDEN)
+                    return
+            pg_pod = str(body.get("pg_pod") or "").strip()
+            pod_name = kx.sanitize_pod_for_workload("postgresql", pg_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid pg_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            r = kx.postgres_psql_query(
+                ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=300, aws_profile=ap, cloud=cl
+            )
+            self._json(
+                {
+                    "ok": r.ok,
+                    "stdout": kx.tail_lines(r.stdout, 12000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                }
+            )
+            return
+
+        if path == "/api/cassandra/exec":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            cql = str(body.get("cql") or "").strip()
+            confirmed = bool(body.get("confirmed"))
+            ro, reason = pgc.classify_cassandra_cql(cql)
+            if not ro and not confirmed:
+                self._json(
+                    {
+                        "ok": False,
+                        "needs_confirmation": True,
+                        "reason": reason or "non-read-only",
+                        "message": "This CQL may write or mutate data. Submit again with confirmed: true after approval.",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            if not ro and confirmed:
+                low = cql.lower()
+                if any(x in low for x in ("rm -rf", ";--", "bash", "curl ", "wget ", "| sh")):
+                    self._json({"ok": False, "error": "CQL blocked even after confirmation."}, HTTPStatus.FORBIDDEN)
+                    return
+            cass_pod = str(body.get("cass_pod") or "").strip()
+            pod_name = kx.sanitize_pod_for_workload("cassandra", cass_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid cass_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            r = kx.cassandra_cqlsh_query(
+                ns, pod_name, kx.CASSANDRA_CONTAINER, cql, timeout=300, aws_profile=ap, cloud=cl
             )
             self._json(
                 {

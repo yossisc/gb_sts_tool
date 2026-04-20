@@ -12,7 +12,7 @@ const navKafka = document.getElementById("nav-kafka");
 const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
 
-const VERSION = "1.0.12";
+const VERSION = "1.0.14";
 
 /** @type {Array<Record<string, unknown>>} */
 let clustersList = [];
@@ -63,7 +63,9 @@ function bindCopyButtons(root) {
     btn.addEventListener("click", async () => {
       const id = btn.getAttribute("data-copy-target");
       const pre = id ? document.getElementById(id) : null;
-      const text = pre ? pre.textContent || "" : "";
+      let text = "";
+      if (pre instanceof HTMLTextAreaElement || pre instanceof HTMLInputElement) text = pre.value || "";
+      else if (pre) text = pre.textContent || "";
       try {
         await navigator.clipboard.writeText(text);
         btn.classList.add("btn-copy--done");
@@ -334,6 +336,7 @@ function wireKafkaTableHeaderSort(tableRoot) {
 }
 
 
+/** @returns {Promise<boolean>} */
 async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
   const u = new URL("/api/kafka/panel", location.origin);
   u.searchParams.set("panel", panelId);
@@ -354,7 +357,7 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
         .join("\n\n");
       elOut.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(blob)}`;
       bindCopyButtons(elOut);
-      return;
+      return false;
     }
     let inner = "";
     if (j.cmd_hint) {
@@ -433,20 +436,23 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
     } else if (panelId === "consumer_groups_list") {
       wireKafkaTableHeaderSort(elOut);
     }
+    return true;
   } catch (e) {
     const d = e.detail || {};
     const blob = JSON.stringify(d, null, 2);
     elOut.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${kafkaPreWithWrapFooter(blob)}`;
     bindCopyButtons(elOut);
+    return false;
   }
 }
 
 /**
- * @param {{ spanAll?: boolean, topicsFilters?: boolean, extraPanelClass?: string }} opts
+ * @param {{ spanAll?: boolean, topicsFilters?: boolean, extraPanelClass?: string, actionButtonText?: string }} opts
  */
 function panelCard(title, bodyElId, opts = {}) {
   const span = opts.spanAll ? " panel--span-all" : "";
   const extra = opts.extraPanelClass ? ` ${opts.extraPanelClass}` : "";
+  const actionLabel = opts.actionButtonText || "Refresh";
   let filters = "";
   if (opts.topicsFilters) {
     filters = `
@@ -466,7 +472,7 @@ function panelCard(title, bodyElId, opts = {}) {
       <div class="panel-head">
         <h2>${esc(title)}</h2>
         <div class="panel-actions">
-          <button type="button" class="btn btn-primary" data-refresh="${esc(bodyElId)}">Refresh</button>
+          <button type="button" class="btn btn-primary" data-refresh="${esc(bodyElId)}">${esc(actionLabel)}</button>
         </div>
       </div>
       ${filters}
@@ -476,30 +482,36 @@ function panelCard(title, bodyElId, opts = {}) {
 }
 
 /**
- * @param {{ needsGroup?: boolean, needsTopic?: boolean, getFetchOpts?: () => Record<string, string> }} opts
+ * @param {{ needsGroup?: boolean, needsTopic?: boolean, getFetchOpts?: () => Record<string, string>, switchToRefreshAfterOk?: boolean }} opts
  */
 function wirePanelRefresh(root, bodyElId, panelId, getGroup, getTopic, opts) {
   const btn = root.querySelector(`[data-refresh="${bodyElId}"]`);
   const out = root.querySelector(`#${bodyElId}`);
   const needsG = !!opts.needsGroup;
   const needsT = !!opts.needsTopic;
+  const flip = !!opts.switchToRefreshAfterOk;
   const getFetchOpts = typeof opts.getFetchOpts === "function" ? opts.getFetchOpts : () => ({});
-  const run = () => {
+  const actionHint = () => (btn && btn.textContent ? String(btn.textContent) : "Refresh");
+  const run = async () => {
     if (needsG && !getGroup()) {
-      out.innerHTML = "<p class='muted'>Enter a <strong>consumer group</strong> above, then click Refresh.</p>";
+      out.innerHTML = `<p class='muted'>Enter a <strong>consumer group</strong> above, then click <strong>${actionHint()}</strong>.</p>`;
       return;
     }
     if (needsT && !getTopic()) {
-      out.innerHTML = "<p class='muted'>Enter a <strong>topic</strong> above, then click Refresh.</p>";
+      out.innerHTML = `<p class='muted'>Enter a <strong>topic</strong> above, then click <strong>${actionHint()}</strong>.</p>`;
       return;
     }
-    loadPanel(panelId, out, getGroup(), getTopic(), getFetchOpts());
+    const before = btn ? String(btn.textContent) : "";
+    const ok = await loadPanel(panelId, out, getGroup(), getTopic(), getFetchOpts());
+    if (flip && ok && btn && before === "Activate") btn.textContent = "Refresh";
   };
-  btn.addEventListener("click", run);
+  btn.addEventListener("click", () => {
+    void run();
+  });
   if (!needsG && !needsT) {
-    run();
+    void run();
   } else {
-    out.innerHTML = "<p class='muted'>Fill group/topic if needed, then click <strong>Refresh</strong>.</p>";
+    out.innerHTML = `<p class='muted'>Fill group/topic if needed, then click <strong>${actionHint()}</strong>.</p>`;
   }
 }
 
@@ -635,6 +647,11 @@ function renderHome() {
   })();
 
   cloudSel.addEventListener("change", toggleAwsProfileRow);
+
+  app.querySelector("#cluster-select")?.addEventListener("change", () => {
+    const typed = app.querySelector("#cluster-typed");
+    if (typed) typed.value = "";
+  });
 
   const listStatus = app.querySelector("#list-clusters-status");
   app.querySelector("#btn-list-clusters").addEventListener("click", async () => {
@@ -1313,7 +1330,7 @@ function renderKafka() {
       <div class="panel-head">
         <h2>Rebalancing</h2>
         <div class="panel-actions">
-          <button type="button" class="btn btn-primary" id="rebalance-analyze-btn">Analyze</button>
+          <button type="button" class="btn btn-primary" id="rebalance-analyze-btn">Activate</button>
         </div>
       </div>
       <p class="muted">
@@ -1325,9 +1342,38 @@ function renderKafka() {
           <input class="text text-narrow" id="rebalance-broker-count" type="number" min="1" max="32" step="1" value="3" />
         </label>
       </div>
-      <p class="muted" id="rebalance-placeholder">Click <strong>Analyze</strong> to scan data directories and show helper commands.</p>
+      <p class="muted" id="rebalance-placeholder">Click <strong>Activate</strong> to scan data directories and show helper commands.</p>
       <div id="rebalance-scan-out" hidden></div>
       <div id="rebalance-commands" hidden></div>
+    </section>
+
+    <section class="panel panel--span-all kafka-rebalance-section kafka-logs-section" aria-labelledby="kafka-logs-title">
+      <div class="panel-head">
+        <h2 id="kafka-logs-title">Kafka logs</h2>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-primary" id="kafka-logs-toggle-btn">Activate</button>
+          <button type="button" class="btn" id="kafka-logs-clear-btn">Clear</button>
+        </div>
+      </div>
+      <p class="muted">
+        Stream <code>kubectl logs</code> from a Kafka StatefulSet pod (<code>--tail 10</code>, <code>-f</code> follow). <strong>Deactivate</strong> stops the stream; <strong>Clear</strong> only empties the text area.
+      </p>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <label class="field field--inline">
+          <span>Pod</span>
+          <select class="text" id="kafka-logs-pod" aria-label="Kafka pod"></select>
+        </label>
+        <label class="field field--inline">
+          <span>Container</span>
+          <select class="text" id="kafka-logs-container" aria-label="Container name">
+            <option value="kafka">kafka</option>
+          </select>
+        </label>
+      </div>
+      <div class="pre-copy-wrap kafka-logs-copy-wrap">
+        <button type="button" class="btn-copy" data-copy-target="kafka-logs-out" title="Copy to clipboard" aria-label="Copy logs to clipboard"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button>
+        <textarea id="kafka-logs-out" class="kafka-logs-textarea" spellcheck="false" readonly rows="12" aria-label="Kafka log output"></textarea>
+      </div>
     </section>
 
     <section class="panel exec-box">
@@ -1358,15 +1404,15 @@ function renderKafka() {
   ];
   const topicPanels = [
     ["Topics × partition counts", "topics_partition_counts", "p-topics", false, false, false, true],
-    ["Topic describe (head)", "topic_describe", "p-t-desc", false, true],
-    ["Topic end offsets (GetOffsetShell)", "topic_offsets_end", "p-t-off", false, true],
+    ["Topic describe (head)", "topic_describe", "p-t-desc", false, true, false, false, "", "activate"],
+    ["Topic end offsets (GetOffsetShell)", "topic_offsets_end", "p-t-off", false, true, false, false, "", "activate"],
   ];
   /** Left ~⅓: consumer list only. Right ~⅔: state → members → verbose. Lag: full-width row below. */
   const groupPanelsLeft = [["Consumer groups (list)", "consumer_groups_list", "p-groups", false, false]];
-  const groupPanelsLag = [["Group lag (describe)", "group_lag", "p-lag", true, false, true, false]];
+  const groupPanelsLag = [["Group lag (describe)", "group_lag", "p-lag", true, false, true, false, "", "activate"]];
   const groupPanelsRight = [
-    ["Group state (--state --verbose)", "group_state", "p-g-state", true, false],
-    ["Group members", "group_members", "p-g-mem", true, false, false, false, "panel--kafka-group-members-span"],
+    ["Group state (--state --verbose)", "group_state", "p-g-state", true, false, false, false, "", "activate"],
+    ["Group members", "group_members", "p-g-mem", true, false, false, false, "panel--kafka-group-members-span", "activate"],
     [
       "Group members + partition assignment",
       "group_members_verbose",
@@ -1376,6 +1422,7 @@ function renderKafka() {
       false,
       false,
       "panel--kafka-group-members-span",
+      "activate",
     ],
   ];
 
@@ -1384,12 +1431,14 @@ function renderKafka() {
     if (!gridEl) return;
     let html = "";
     for (const row of rows) {
-      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
-      html += panelCard(title, bid, {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls, panelOpts] = row;
+      const cardOpts = {
         spanAll: !!spanAll,
         topicsFilters: !!topicsFilters,
         extraPanelClass: typeof extraCls === "string" ? extraCls : "",
-      });
+      };
+      if (panelOpts === "activate") cardOpts.actionButtonText = "Activate";
+      html += panelCard(title, bid, cardOpts);
     }
     gridEl.innerHTML = html;
   }
@@ -1399,30 +1448,36 @@ function renderKafka() {
     if (!rootEl) return;
     let leftHtml = "";
     for (const row of leftRows) {
-      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
-      leftHtml += panelCard(title, bid, {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls, panelOpts] = row;
+      const cardOpts = {
         spanAll: !!spanAll,
         topicsFilters: !!topicsFilters,
         extraPanelClass: typeof extraCls === "string" ? extraCls : "",
-      });
+      };
+      if (panelOpts === "activate") cardOpts.actionButtonText = "Activate";
+      leftHtml += panelCard(title, bid, cardOpts);
     }
     let rightHtml = "";
     for (const row of rightRows) {
-      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
-      rightHtml += panelCard(title, bid, {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls, panelOpts] = row;
+      const cardOpts = {
         spanAll: !!spanAll,
         topicsFilters: !!topicsFilters,
         extraPanelClass: typeof extraCls === "string" ? extraCls : "",
-      });
+      };
+      if (panelOpts === "activate") cardOpts.actionButtonText = "Activate";
+      rightHtml += panelCard(title, bid, cardOpts);
     }
     let lagHtml = "";
     for (const row of lagRows) {
-      const [title, , bid, , , spanAll, topicsFilters, extraCls] = row;
-      lagHtml += panelCard(title, bid, {
+      const [title, , bid, , , spanAll, topicsFilters, extraCls, panelOpts] = row;
+      const cardOpts = {
         spanAll: !!spanAll,
         topicsFilters: !!topicsFilters,
         extraPanelClass: typeof extraCls === "string" ? extraCls : "",
-      });
+      };
+      if (panelOpts === "activate") cardOpts.actionButtonText = "Activate";
+      lagHtml += panelCard(title, bid, cardOpts);
     }
     rootEl.innerHTML = `<div class="kafka-groups-wrapper">
       <div class="kafka-groups-layout">
@@ -1596,9 +1651,10 @@ ${preWithCopy(c3)}`;
   function wireKafkaRows(gridEl, rows) {
     if (!gridEl) return;
     for (const row of rows) {
-      const [, pid, bid, needsGroup, needsTopic, , topicsFilters] = row;
+      const [, pid, bid, needsGroup, needsTopic, , topicsFilters, , panelOpts] = row;
       const opts = { needsGroup, needsTopic };
       if (topicsFilters) opts.getFetchOpts = topicsFetchOpts;
+      if (panelOpts === "activate") opts.switchToRefreshAfterOk = true;
       wirePanelRefresh(gridEl, bid, pid, g, t, opts);
     }
   }
@@ -1606,6 +1662,115 @@ ${preWithCopy(c3)}`;
   wireKafkaRows(gridBrokers, brokerPanels);
   wireKafkaRows(gridTopics, topicPanels);
   wireKafkaRows(gridGroups, [...groupPanelsLeft, ...groupPanelsRight, ...groupPanelsLag]);
+
+  (async () => {
+    let stack = null;
+    try {
+      stack = await fetchJson("/api/k8s/stack");
+    } catch {
+      stack = null;
+    }
+    const sel = document.getElementById("kafka-logs-pod");
+    if (!sel) return;
+    const kc = stack?.ok && stack.components?.kafka ? stack.components.kafka : null;
+    const pods = kc?.pods;
+    sel.innerHTML = "";
+    if (Array.isArray(pods) && pods.length > 0) {
+      for (const name of pods.slice(0, 32)) {
+        const o = document.createElement("option");
+        o.value = String(name);
+        o.textContent = String(name);
+        sel.appendChild(o);
+      }
+    } else {
+      const rep = Number(kc?.replicas);
+      const n = Number.isFinite(rep) && rep > 0 ? Math.min(32, Math.floor(rep)) : 1;
+      for (let i = 0; i < n; i++) {
+        const o = document.createElement("option");
+        o.value = `glassbox-kafka-${i}`;
+        o.textContent = `glassbox-kafka-${i}`;
+        sel.appendChild(o);
+      }
+    }
+  })();
+
+  bindCopyButtons(app.querySelector(".kafka-logs-section") || app);
+
+  const kafkaLogsTa = document.getElementById("kafka-logs-out");
+  const kafkaLogsBtn = document.getElementById("kafka-logs-toggle-btn");
+  const kafkaLogsClear = document.getElementById("kafka-logs-clear-btn");
+  /** @type {AbortController | null} */
+  let kafkaLogsAbort = null;
+
+  function kafkaLogsStopUi() {
+    kafkaLogsAbort = null;
+    if (kafkaLogsBtn) kafkaLogsBtn.textContent = "Activate";
+  }
+
+  async function kafkaLogsRunStream() {
+    if (!kafkaLogsTa || !kafkaLogsBtn) return;
+    if (kafkaLogsAbort) return;
+    const pod = document.getElementById("kafka-logs-pod")?.value ?? "glassbox-kafka-0";
+    const container = document.getElementById("kafka-logs-container")?.value ?? "kafka";
+    const u = new URL("/api/kafka/logs/stream", location.origin);
+    u.searchParams.set("pod", pod);
+    u.searchParams.set("container", container);
+    kafkaLogsAbort = new AbortController();
+    kafkaLogsBtn.textContent = "Deactivate";
+    try {
+      const r = await fetch(u.toString(), { credentials: "same-origin", signal: kafkaLogsAbort.signal });
+      if (!r.ok) {
+        const txt = await r.text();
+        kafkaLogsTa.value += `\n[HTTP ${r.status}] ${txt.slice(0, 800)}\n`;
+        return;
+      }
+      const reader = r.body?.getReader();
+      if (!reader) {
+        kafkaLogsTa.value += "\n[No response body]\n";
+        return;
+      }
+      const dec = new TextDecoder();
+      let carry = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        carry += dec.decode(value, { stream: true });
+        let sep;
+        while ((sep = carry.indexOf("\n\n")) >= 0) {
+          const block = carry.slice(0, sep);
+          carry = carry.slice(sep + 2);
+          for (const ln of block.split("\n")) {
+            if (!ln.startsWith("data: ")) continue;
+            const raw = ln.slice(6);
+            try {
+              const o = JSON.parse(raw);
+              if (o.line != null) kafkaLogsTa.value += `${o.line}\n`;
+            } catch {
+              kafkaLogsTa.value += `${raw}\n`;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (e && /** @type {Error} */ (e).name !== "AbortError" && kafkaLogsTa) {
+        kafkaLogsTa.value += `\n[${String(/** @type {Error} */ (e).message || e)}]\n`;
+      }
+    } finally {
+      kafkaLogsStopUi();
+    }
+  }
+
+  kafkaLogsBtn?.addEventListener("click", () => {
+    if (kafkaLogsAbort) {
+      kafkaLogsAbort.abort();
+      return;
+    }
+    void kafkaLogsRunStream();
+  });
+
+  kafkaLogsClear?.addEventListener("click", () => {
+    if (kafkaLogsTa) kafkaLogsTa.value = "";
+  });
 
   const execWrap = app.querySelector("#exec-out-wrap");
   const execInner = app.querySelector("#exec-out-inner");

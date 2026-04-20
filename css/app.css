@@ -481,6 +481,37 @@ select.text {
   align-items: center;
 }
 
+.kafka-logs-toolbar {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-end;
+}
+
+.kafka-logs-copy-wrap {
+  margin-top: 0.75rem;
+}
+
+.kafka-logs-copy-wrap .kafka-logs-textarea {
+  margin-top: 0;
+  padding-right: 2.35rem;
+}
+
+.kafka-logs-textarea {
+  width: 100%;
+  margin-top: 0.75rem;
+  min-height: 12rem;
+  padding: 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
 .kafka-rebalance-th-check,
 .kafka-rebalance-td-check {
   width: 5.5rem;

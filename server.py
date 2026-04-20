@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shlex
 import socket
+import subprocess
 import sys
 import urllib.parse
 from http import HTTPStatus
@@ -23,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.12"
+VERSION = "1.0.14"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -316,6 +318,159 @@ rm -f "$D"
     return None, "unknown panel"
 
 
+def _sse_write_chunk(wfile, obj: object) -> bool:
+    try:
+        payload = json.dumps(obj, ensure_ascii=False)
+        wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        wfile.flush()
+        return True
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return False
+
+
+def _kafka_logs_stream(handler: SimpleHTTPRequestHandler, qs: dict[str, list[str]]) -> None:
+    s = _session_from(handler)
+    if not s:
+        handler._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+        return
+    pod_raw = (qs.get("pod") or [""])[0].strip()
+    cont_raw = (qs.get("container") or [kx.KAFKA_CONTAINER])[0].strip()
+    pod_name = kx.sanitize_kafka_logs_pod(pod_raw)
+    if not pod_name:
+        handler._json(
+            {"ok": False, "error": "Invalid pod (expected glassbox-kafka-0 … glassbox-kafka-31)."},
+            HTTPStatus.BAD_REQUEST,
+        )
+        return
+    container = kx.sanitize_kafka_logs_container(cont_raw)
+    if not container:
+        handler._json(
+            {"ok": False, "error": f"Invalid container (only {kx.KAFKA_CONTAINER!r} is allowed)."},
+            HTTPStatus.BAD_REQUEST,
+        )
+        return
+    ns = str(s["n"])
+    cl = _cloud_from_session(s)
+    ap = _aws_profile_from_session(s)
+    env = kx.subprocess_env(ap, cl)
+    argv = [
+        "kubectl",
+        "logs",
+        "-n",
+        ns,
+        pod_name,
+        "-c",
+        container,
+        "--tail",
+        "10",
+        "-f",
+    ]
+    proc: subprocess.Popen | None = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env=env,
+        )
+    except OSError as e:
+        handler._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_GATEWAY)
+        return
+    assert proc.stdout is not None
+    out = proc.stdout
+    req = handler.request
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Connection", "close")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.end_headers()
+    buf = b""
+
+    def flush_tail() -> bool:
+        nonlocal buf
+        if not buf:
+            return True
+        ok = _sse_write_chunk(handler.wfile, {"line": buf.decode("utf-8", errors="replace")})
+        buf = b""
+        return ok
+
+    try:
+        while True:
+            try:
+                r_fds, _, _ = select.select([out.fileno(), req.fileno()], [], [], 300.0)
+            except (ValueError, OSError):
+                break
+
+            if not r_fds:
+                if proc.poll() is not None:
+                    remainder = out.read() or b""
+                    if remainder:
+                        buf += remainder
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            if not _sse_write_chunk(handler.wfile, {"line": line.decode("utf-8", errors="replace")}):
+                                return
+                        if buf and not flush_tail():
+                            return
+                    break
+                continue
+
+            if req.fileno() in r_fds:
+                try:
+                    drained = req.recv(4096)
+                except OSError:
+                    drained = b""
+                if not drained:
+                    break
+
+            if out.fileno() in r_fds:
+                try:
+                    chunk = os.read(out.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if buf and not flush_tail():
+                        return
+                    if proc.poll() is not None:
+                        break
+                    continue
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not _sse_write_chunk(handler.wfile, {"line": line.decode("utf-8", errors="replace")}):
+                        return
+                continue
+
+            if proc.poll() is not None:
+                remainder = out.read() or b""
+                if remainder:
+                    buf += remainder
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not _sse_write_chunk(handler.wfile, {"line": line.decode("utf-8", errors="replace")}):
+                            return
+                    if buf and not flush_tail():
+                        return
+                break
+        rc = proc.poll()
+        if rc not in (None, 0) and not _sse_write_chunk(
+            handler.wfile, {"line": f"[kubectl logs exited {rc}]"}
+        ):
+            return
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -546,6 +701,10 @@ class Handler(SimpleHTTPRequestHandler):
                     "pod": pod_name,
                 }
             )
+            return
+
+        if path == "/api/kafka/logs/stream":
+            _kafka_logs_stream(self, qs)
             return
 
         if path == "/api/kafka/panel":

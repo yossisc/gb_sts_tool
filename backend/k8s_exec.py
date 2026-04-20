@@ -44,6 +44,26 @@ _WRITE_MARKERS = (
 
 _SAFE_TOPIC_GROUP = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+_KAFKA_LOGS_POD = re.compile(r"^glassbox-kafka-(\d+)$")
+
+
+def sanitize_kafka_logs_pod(pod: str) -> str | None:
+    """Allow only ``glassbox-kafka-<n>`` with n in 0..31."""
+    m = _KAFKA_LOGS_POD.match((pod or "").strip())
+    if not m:
+        return None
+    i = int(m.group(1))
+    if i < 0 or i > 31:
+        return None
+    return f"glassbox-kafka-{i}"
+
+
+def sanitize_kafka_logs_container(container: str) -> str | None:
+    c = (container or "").strip()
+    if c == KAFKA_CONTAINER:
+        return c
+    return None
+
 
 @dataclass
 class CmdResult:

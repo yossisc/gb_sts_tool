@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -45,6 +45,7 @@ _LOG_DEFAULT_CONT: dict[str, str] = {
     "kafka": kx.KAFKA_CONTAINER,
     "clickhouse": kx.CLICKHOUSE_CONTAINER,
     "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
+    "opensearch": kx.OPENSEARCH_CONTAINER,
     "postgresql": kx.POSTGRES_CONTAINER,
     "cassandra": kx.CASSANDRA_CONTAINER,
 }
@@ -187,6 +188,15 @@ def _es_pod_index_from_qs(qs: dict[str, list[str]]) -> int:
     return max(0, min(n, 31))
 
 
+def _os_pod_index_from_qs(qs: dict[str, list[str]]) -> int:
+    raw = (qs.get("os_pod") or ["0"])[0].strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(n, 31))
+
+
 def _idx_health_from_qs(qs: dict[str, list[str]]) -> str:
     h = (qs.get("idx_health") or ["all"])[0].strip().lower()
     return h if h in ("all", "green", "yellow", "red") else "all"
@@ -195,6 +205,13 @@ def _idx_health_from_qs(qs: dict[str, list[str]]) -> str:
 def _idx_state_from_qs(qs: dict[str, list[str]]) -> str:
     st = (qs.get("idx_state") or ["all"])[0].strip().lower()
     return st if st in ("all", "open", "close") else "all"
+
+
+def _shards_substring_from_qs(qs: dict[str, list[str]]) -> str:
+    try:
+        return esp.sanitize_shards_substring((qs.get("shards_substring") or [""])[0])
+    except ValueError as e:
+        raise ValueError(str(e)) from e
 
 
 def _alloc_body_from_qs(qs: dict[str, list[str]]) -> str:
@@ -349,7 +366,7 @@ def _workload_logs_stream(
         handler._json(
             {
                 "ok": False,
-                "error": "Missing or invalid workload (use kafka, clickhouse, elasticsearch, postgresql, cassandra).",
+                "error": "Missing or invalid workload (use kafka, clickhouse, elasticsearch, opensearch, postgresql, cassandra).",
             },
             HTTPStatus.BAD_REQUEST,
         )
@@ -522,6 +539,192 @@ class Handler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _search_engine_panel_get(self, qs: dict[str, list[str]], *, engine: str) -> None:
+        """Elasticsearch or OpenSearch HTTP panels (shared paths on localhost:9200 in pod)."""
+        s = _session_from(self)
+        if not s:
+            self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+            return
+        ns = s["n"]
+        cl = _cloud_from_session(s)
+        ap = _aws_profile_from_session(s)
+        panel = (qs.get("panel") or [""])[0].strip()
+        if engine == "elasticsearch":
+            if panel not in esp.ES_PANEL_IDS:
+                self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
+                return
+            es_panel = panel
+            es_pod = _es_pod_index_from_qs(qs)
+            pod_name = f"{kx.ELASTICSEARCH_POD_PREFIX}{es_pod}"
+            container = kx.ELASTICSEARCH_CONTAINER
+            cmd_hint_map = esp.ES_PANEL_CMD_HINT
+        elif engine == "opensearch":
+            if panel not in esp.OS_PANEL_IDS:
+                self._json({"ok": False, "error": "unknown OpenSearch panel"}, HTTPStatus.BAD_REQUEST)
+                return
+            es_panel = esp.os_panel_to_es_panel(panel)
+            es_pod = _os_pod_index_from_qs(qs)
+            pod_name = f"{kx.OPENSEARCH_POD_PREFIX}{es_pod}"
+            container = kx.OPENSEARCH_CONTAINER
+            cmd_hint_map = esp.OS_PANEL_CMD_HINT
+        else:
+            self._json({"ok": False, "error": "internal: bad engine"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        idx_health = _idx_health_from_qs(qs)
+        idx_state = _idx_state_from_qs(qs)
+        try:
+            idx_sub = esp.sanitize_idx_substring((qs.get("idx_substring") or [""])[0])
+        except ValueError as e:
+            self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            shards_sub = _shards_substring_from_qs(qs)
+        except ValueError as e:
+            self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            alloc_body = _alloc_body_from_qs(qs)
+        except ValueError as e:
+            self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+        index_pattern = (qs.get("index_pattern") or [""])[0].strip()
+        try:
+            method, path_qs, req_body = esp.es_request_for_panel(
+                es_panel,
+                index_pattern=index_pattern,
+                alloc_body=alloc_body,
+            )
+        except ValueError as e:
+            self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+        timeout = (
+            240
+            if es_panel
+            in ("es_nodes_stats", "es_cluster_stats", "es_cluster_state_metadata", "es_cluster_health_shards")
+            else 150
+        )
+        r = kx.elasticsearch_curl(
+            ns,
+            pod_name,
+            container,
+            path_qs,
+            method=method,
+            body=req_body,
+            timeout=timeout,
+            aws_profile=ap,
+            cloud=cl,
+        )
+        out_stdout = r.stdout or ""
+        if es_panel == "es_cat_indices" and r.ok:
+            out_stdout = esp.postprocess_cat_indices(out_stdout, idx_health, idx_state, idx_sub)
+        table: list[list[str]] | None = None
+        if r.ok:
+            if es_panel == "es_cat_indices":
+                table = esp.table_from_cat_indices_stdout(out_stdout)
+            elif es_panel == "es_cat_indices_named":
+                table = esp.table_from_cat_indices_stdout(out_stdout)
+            elif es_panel == "es_cat_shards":
+                table = esp.table_from_cat_shards_stdout(out_stdout, shards_sub)
+            elif es_panel == "es_cat_shards_named":
+                table = esp.table_from_cat_shards_stdout(out_stdout, shards_sub)
+            elif es_panel == "es_cat_recovery":
+                table = esp.table_from_cat_recovery_stdout(out_stdout, idx_sub)
+            elif es_panel == "es_cat_shard_stores":
+                table = esp.table_from_cat_shard_stores_stdout(out_stdout, shards_sub)
+        tail_n = 20000 if es_panel in ("es_nodes_stats", "es_cluster_stats") else 12000
+        out_payload: dict = {
+            "ok": r.ok,
+            "panel": panel,
+            "stdout": kx.tail_lines(out_stdout, tail_n),
+            "stderr": kx.filter_kubectl_noise(r.stderr),
+            "returncode": r.returncode,
+            "cmd_display": r.cmd_display,
+            "cmd_hint": cmd_hint_map.get(panel, ""),
+            "http_method": method,
+            "path_executed": path_qs,
+            "pod": pod_name,
+        }
+        if table is not None:
+            out_payload["table"] = table
+        self._json(out_payload)
+
+    def _search_engine_exec_post(self, body: dict, *, engine: str) -> None:
+        s = _session_from(self)
+        if not s:
+            self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+            return
+        method = str(body.get("method") or "GET").strip().upper()
+        if method != "GET":
+            self._json(
+                {"ok": False, "error": f"Custom {engine} exec supports GET only."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        path_q = str(body.get("path") or "").strip()
+        if not path_q:
+            self._json({"ok": False, "error": "path is required (e.g. /_cluster/health?pretty)"}, HTTPStatus.BAD_REQUEST)
+            return
+        confirmed = bool(body.get("confirmed"))
+        ro, reason = kx.classify_es_custom_get(path_q)
+        if not ro and not confirmed:
+            self._json(
+                {
+                    "ok": False,
+                    "needs_confirmation": True,
+                    "reason": reason or "path not on read-only allowlist",
+                    "message": "Submit again with confirmed: true if you accept this request.",
+                },
+                HTTPStatus.CONFLICT,
+            )
+            return
+        if not ro and confirmed:
+            low = path_q.lower()
+            if any(x in low for x in ("_bulk", "_doc/", "script", "delete_by_query")):
+                self._json({"ok": False, "error": "Path blocked even after confirmation."}, HTTPStatus.FORBIDDEN)
+                return
+        if engine == "elasticsearch":
+            try:
+                pod_i = int(body.get("es_pod") if body.get("es_pod") is not None else 0)
+            except (TypeError, ValueError):
+                pod_i = 0
+            pod_i = max(0, min(pod_i, 31))
+            pod_name = f"{kx.ELASTICSEARCH_POD_PREFIX}{pod_i}"
+            container = kx.ELASTICSEARCH_CONTAINER
+        else:
+            try:
+                pod_i = int(body.get("os_pod") if body.get("os_pod") is not None else 0)
+            except (TypeError, ValueError):
+                pod_i = 0
+            pod_i = max(0, min(pod_i, 31))
+            pod_name = f"{kx.OPENSEARCH_POD_PREFIX}{pod_i}"
+            container = kx.OPENSEARCH_CONTAINER
+        ns = s["n"]
+        cl = _cloud_from_session(s)
+        ap = _aws_profile_from_session(s)
+        r = kx.elasticsearch_curl(
+            ns,
+            pod_name,
+            container,
+            path_q,
+            method="GET",
+            body=None,
+            timeout=180,
+            aws_profile=ap,
+            cloud=cl,
+        )
+        self._json(
+            {
+                "ok": r.ok,
+                "stdout": kx.tail_lines(r.stdout, 12000),
+                "stderr": kx.filter_kubectl_noise(r.stderr),
+                "returncode": r.returncode,
+                "cmd_display": r.cmd_display,
+                "pod": pod_name,
+                "path_executed": path_q,
+            }
+        )
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -535,6 +738,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "kafka_pod": kx.KAFKA_POD,
                 "clickhouse_pod_prefix": kx.CLICKHOUSE_POD_PREFIX,
                 "elasticsearch_pod_prefix": kx.ELASTICSEARCH_POD_PREFIX,
+                "opensearch_pod_prefix": kx.OPENSEARCH_POD_PREFIX,
             })
             return
 
@@ -580,6 +784,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "kafka": kx.KAFKA_CONTAINER,
                     "clickhouse": kx.CLICKHOUSE_CONTAINER,
                     "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
+                    "opensearch": kx.OPENSEARCH_CONTAINER,
                     "postgresql": kx.POSTGRES_CONTAINER,
                     "cassandra": kx.CASSANDRA_CONTAINER,
                 },
@@ -662,68 +867,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/elasticsearch/panel":
-            s = _session_from(self)
-            if not s:
-                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
-                return
-            ns = s["n"]
-            cl = _cloud_from_session(s)
-            ap = _aws_profile_from_session(s)
-            panel = (qs.get("panel") or [""])[0].strip()
-            es_pod = _es_pod_index_from_qs(qs)
-            idx_health = _idx_health_from_qs(qs)
-            idx_state = _idx_state_from_qs(qs)
-            try:
-                idx_sub = esp.sanitize_idx_substring((qs.get("idx_substring") or [""])[0])
-            except ValueError as e:
-                self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                alloc_body = _alloc_body_from_qs(qs)
-            except ValueError as e:
-                self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
-                return
-            index_pattern = (qs.get("index_pattern") or [""])[0].strip()
-            try:
-                method, path_qs, req_body = esp.es_request_for_panel(
-                    panel,
-                    index_pattern=index_pattern,
-                    alloc_body=alloc_body,
-                )
-            except ValueError as e:
-                self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
-                return
-            pod_name = f"{kx.ELASTICSEARCH_POD_PREFIX}{es_pod}"
-            timeout = 240 if panel in ("es_nodes_stats", "es_cluster_stats", "es_cluster_state_metadata") else 150
-            r = kx.elasticsearch_curl(
-                ns,
-                pod_name,
-                kx.ELASTICSEARCH_CONTAINER,
-                path_qs,
-                method=method,
-                body=req_body,
-                timeout=timeout,
-                aws_profile=ap,
-                cloud=cl,
-            )
-            out_stdout = r.stdout or ""
-            if panel == "es_cat_indices" and r.ok:
-                out_stdout = esp.postprocess_cat_indices(out_stdout, idx_health, idx_state, idx_sub)
-            tail_n = 20000 if panel in ("es_nodes_stats", "es_cluster_stats") else 12000
-            self._json(
-                {
-                    "ok": r.ok,
-                    "panel": panel,
-                    "stdout": kx.tail_lines(out_stdout, tail_n),
-                    "stderr": kx.filter_kubectl_noise(r.stderr),
-                    "returncode": r.returncode,
-                    "cmd_display": r.cmd_display,
-                    "cmd_hint": esp.ES_PANEL_CMD_HINT.get(panel, ""),
-                    "http_method": method,
-                    "path_executed": path_qs,
-                    "pod": pod_name,
-                }
-            )
+            self._search_engine_panel_get(qs, engine="elasticsearch")
+            return
+
+        if path == "/api/opensearch/panel":
+            self._search_engine_panel_get(qs, engine="opensearch")
             return
 
         if path == "/api/kafka/logs/stream":
@@ -1388,67 +1536,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/elasticsearch/exec":
-            s = _session_from(self)
-            if not s:
-                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
-                return
-            method = str(body.get("method") or "GET").strip().upper()
-            if method != "GET":
-                self._json({"ok": False, "error": "Custom Elasticsearch exec supports GET only."}, HTTPStatus.BAD_REQUEST)
-                return
-            path_q = str(body.get("path") or "").strip()
-            if not path_q:
-                self._json({"ok": False, "error": "path is required (e.g. /_cluster/health?pretty)"}, HTTPStatus.BAD_REQUEST)
-                return
-            confirmed = bool(body.get("confirmed"))
-            ro, reason = kx.classify_es_custom_get(path_q)
-            if not ro and not confirmed:
-                self._json(
-                    {
-                        "ok": False,
-                        "needs_confirmation": True,
-                        "reason": reason or "path not on read-only allowlist",
-                        "message": "Submit again with confirmed: true if you accept this request.",
-                    },
-                    HTTPStatus.CONFLICT,
-                )
-                return
-            if not ro and confirmed:
-                low = path_q.lower()
-                if any(x in low for x in ("_bulk", "_doc/", "script", "delete_by_query")):
-                    self._json({"ok": False, "error": "Path blocked even after confirmation."}, HTTPStatus.FORBIDDEN)
-                    return
-            try:
-                es_pod = int(body.get("es_pod") if body.get("es_pod") is not None else 0)
-            except (TypeError, ValueError):
-                es_pod = 0
-            es_pod = max(0, min(es_pod, 31))
-            ns = s["n"]
-            cl = _cloud_from_session(s)
-            ap = _aws_profile_from_session(s)
-            pod_name = f"{kx.ELASTICSEARCH_POD_PREFIX}{es_pod}"
-            r = kx.elasticsearch_curl(
-                ns,
-                pod_name,
-                kx.ELASTICSEARCH_CONTAINER,
-                path_q,
-                method="GET",
-                body=None,
-                timeout=180,
-                aws_profile=ap,
-                cloud=cl,
-            )
-            self._json(
-                {
-                    "ok": r.ok,
-                    "stdout": kx.tail_lines(r.stdout, 12000),
-                    "stderr": kx.filter_kubectl_noise(r.stderr),
-                    "returncode": r.returncode,
-                    "cmd_display": r.cmd_display,
-                    "pod": pod_name,
-                    "path_executed": path_q,
-                }
-            )
+            self._search_engine_exec_post(body, engine="elasticsearch")
+            return
+
+        if path == "/api/opensearch/exec":
+            self._search_engine_exec_post(body, engine="opensearch")
             return
 
         if path == "/api/kafka/exec":

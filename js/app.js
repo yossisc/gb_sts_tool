@@ -11,10 +11,21 @@ const k8sAwsEl = document.getElementById("k8s-aws");
 const navKafka = document.getElementById("nav-kafka");
 const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
+const navOpensearch = document.getElementById("nav-opensearch");
 const navPostgres = document.getElementById("nav-postgres");
 const navCassandra = document.getElementById("nav-cassandra");
 
-const VERSION = "1.0.16";
+/** @type {Array<[HTMLElement | null, string]>} anchor → ``stack.components`` id */
+const WORKLOAD_NAV_STACK_KEYS = [
+  [navKafka, "kafka"],
+  [navClickhouse, "clickhouse"],
+  [navElasticsearch, "elasticsearch"],
+  [navOpensearch, "opensearch"],
+  [navPostgres, "postgresql"],
+  [navCassandra, "cassandra"],
+];
+
+const VERSION = "1.0.22";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -26,6 +37,7 @@ const WL_STACK_COMP = {
   kafka: "kafka",
   clickhouse: "clickhouse",
   elasticsearch: "elasticsearch",
+  opensearch: "opensearch",
   postgresql: "postgresql",
   cassandra: "cassandra",
 };
@@ -34,12 +46,48 @@ const WL_DEFAULT_POD = {
   kafka: "glassbox-kafka-0",
   clickhouse: "glassbox-clickhouse-0",
   elasticsearch: "glassbox-elasticsearch-master-0",
+  opensearch: "glassbox-opensearch-master-0",
   postgresql: "glassbox-postgresql-0",
   cassandra: "glassbox-cassandra-0",
 };
 
+/**
+ * @typedef {{ idPx: string, panelPx: string, apiPanel: string, apiExec: string, qsPod: string, workloadLogs: string, stackComp: string, podStem: string, containerLabel: string, containerEnv: string, pageName: string }} SearchPageCfg
+ */
+/** @type {Record<string, SearchPageCfg>} */
+const SEARCH_PAGE_CFGS = {
+  elasticsearch: {
+    idPx: "es",
+    panelPx: "es_",
+    apiPanel: "/api/elasticsearch/panel",
+    apiExec: "/api/elasticsearch/exec",
+    qsPod: "es_pod",
+    workloadLogs: "elasticsearch",
+    stackComp: "elasticsearch",
+    podStem: "glassbox-elasticsearch-master",
+    containerLabel: "elasticsearch",
+    containerEnv: "GB_STS_ES_CONTAINER",
+    pageName: "Elasticsearch",
+  },
+  opensearch: {
+    idPx: "os",
+    panelPx: "os_",
+    apiPanel: "/api/opensearch/panel",
+    apiExec: "/api/opensearch/exec",
+    qsPod: "os_pod",
+    workloadLogs: "opensearch",
+    stackComp: "opensearch",
+    podStem: "glassbox-opensearch-master",
+    containerLabel: "opensearch",
+    containerEnv: "GB_STS_OS_CONTAINER",
+    pageName: "OpenSearch",
+  },
+};
+
 /** @type {Array<Record<string, unknown>>} */
 let clustersList = [];
+/** Last “List clusters” result + selection for this tab (homepage restore). */
+const HOME_CLUSTER_LIST_KEY = "gb_sts_home_cluster_list_v1";
 let copyBtnSeq = 0;
 
 function esc(s) {
@@ -132,6 +180,9 @@ function workloadLogsPanelHtml(workload, title) {
         <button type="button" class="btn-copy" data-copy-target="${esc(idBase)}-out" title="Copy to clipboard" aria-label="Copy logs to clipboard"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button>
         <div id="${esc(idBase)}-out" class="workload-logs-display kafka-logs-textarea" tabindex="0" role="log" aria-live="polite"></div>
       </div>
+      <div class="panel-output-footer">
+        <label class="wrap-chk"><input type="checkbox" class="js-pre-wrap" data-pre-id="${esc(idBase)}-out" checked /> wrap</label>
+      </div>
     </section>`;
 }
 
@@ -145,6 +196,7 @@ function workloadLogContainerDefault(workload) {
     kafka: "kafka",
     clickhouse: "glassbox-clickhouse",
     elasticsearch: "elasticsearch",
+    opensearch: "opensearch",
     postgresql: "glassbox-postgresql",
     cassandra: "cassandra",
   };
@@ -319,6 +371,27 @@ function formatKafkaCmdHint(rawHint, topic, group) {
     .join("");
 }
 
+/** Highlight ``indexPattern`` wherever it appears literally in ``text`` (for ES path / curl hints). */
+function formatEsIndexHighlight(text, indexPattern) {
+  const p = (indexPattern || "").trim();
+  const raw = String(text ?? "");
+  if (!p || !raw) return esc(raw);
+  const out = [];
+  let i = 0;
+  const L = p.length;
+  while (i < raw.length) {
+    const j = raw.indexOf(p, i);
+    if (j < 0) {
+      out.push(esc(raw.slice(i)));
+      break;
+    }
+    out.push(esc(raw.slice(i, j)));
+    out.push(`<mark class="es-index-hint-hit">${esc(p)}</mark>`);
+    i = j + L;
+  }
+  return out.join("");
+}
+
 function preWithCopy(rawText) {
   const id = `pre-copy-${++copyBtnSeq}`;
   return `<div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="output-pre" id="${id}">${esc(rawText || "")}</pre></div>`;
@@ -376,6 +449,100 @@ async function fetchJson(url, opts = {}) {
 
 let sessionVerified = false;
 
+function stackFromSessionStorage() {
+  try {
+    const raw = sessionStorage.getItem("gb_sts_stack");
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stack JSON from tab session or ``/api/k8s/stack`` when verified but cache missing.
+ * @returns {Promise<Record<string, unknown> | null>}
+ */
+async function fetchStackJsonIfVerified() {
+  if (!sessionVerified) return null;
+  let st = stackFromSessionStorage();
+  if (st && st.ok === true && st.components && typeof st.components === "object") return st;
+  try {
+    const j = await fetchJson("/api/k8s/stack");
+    if (j && j.ok === true && j.components && typeof j.components === "object") {
+      try {
+        sessionStorage.setItem("gb_sts_stack", JSON.stringify(j));
+      } catch {
+        /* ignore */
+      }
+      return j;
+    }
+  } catch {
+    /* ignore */
+  }
+  return st;
+}
+
+/**
+ * Gray out nav links when probe reports 0 replicas for that component (stack known).
+ * @param {Record<string, unknown> | null} st
+ */
+function applyWorkloadNavAvailability(st) {
+  for (const [el, compKey] of WORKLOAD_NAV_STACK_KEYS) {
+    if (!el) continue;
+    const known = !!(st && st.ok === true && st.components && typeof st.components === "object");
+    let rep = 0;
+    if (known) {
+      const entry = /** @type {Record<string, unknown>} */ (st.components)[compKey];
+      rep =
+        entry && typeof entry === "object" && typeof entry.replicas === "number" && Number.isFinite(entry.replicas)
+          ? entry.replicas
+          : 0;
+    }
+    const disabled = known && rep <= 0;
+    if (disabled) {
+      el.classList.add("nav-disabled");
+      el.setAttribute("aria-disabled", "true");
+      el.setAttribute("tabindex", "-1");
+      el.title = "No pods for this workload in the connected namespace.";
+    } else {
+      el.classList.remove("nav-disabled");
+      el.removeAttribute("aria-disabled");
+      el.removeAttribute("tabindex");
+      el.removeAttribute("title");
+    }
+  }
+}
+
+function clearWorkloadNavDisabledState() {
+  for (const [el] of WORKLOAD_NAV_STACK_KEYS) {
+    if (!el) continue;
+    el.classList.remove("nav-disabled");
+    el.removeAttribute("aria-disabled");
+    el.removeAttribute("tabindex");
+    el.removeAttribute("title");
+  }
+}
+
+function isCurrentHashWorkloadDisabled() {
+  const h = location.hash || "#/";
+  const pairs = [
+    ["#/kafka", navKafka],
+    ["#/clickhouse", navClickhouse],
+    ["#/elasticsearch", navElasticsearch],
+    ["#/opensearch", navOpensearch],
+    ["#/postgres", navPostgres],
+    ["#/cassandra", navCassandra],
+  ];
+  for (const [prefix, el] of pairs) {
+    if (h === prefix || (prefix !== "#/" && h.startsWith(prefix))) {
+      return !!(el && el.classList.contains("nav-disabled"));
+    }
+  }
+  return false;
+}
+
 async function refreshK8sStrip() {
   try {
     const j = await fetchJson("/api/k8s/context");
@@ -417,12 +584,18 @@ async function refreshSessionUi() {
       const reg = s.session.r ? ` · ${s.session.r}` : "";
       const cl = s.session.d ? ` · ${String(s.session.d).toUpperCase()}` : "";
       footerSession.textContent = `Session: namespace ${s.session.n} · match “${s.session.c}”${cl}${reg}${ap}`;
+      const st = await fetchStackJsonIfVerified();
+      applyWorkloadNavAvailability(st);
+      if (isCurrentHashWorkloadDisabled()) {
+        location.hash = "#/";
+      }
     } else {
       navKafka.hidden = true;
       if (navClickhouse) navClickhouse.hidden = true;
       if (navElasticsearch) navElasticsearch.hidden = true;
       if (navPostgres) navPostgres.hidden = true;
       if (navCassandra) navCassandra.hidden = true;
+      clearWorkloadNavDisabledState();
       footerSession.textContent = "Session: not connected";
     }
   } catch {
@@ -432,6 +605,7 @@ async function refreshSessionUi() {
     if (navElasticsearch) navElasticsearch.hidden = true;
     if (navPostgres) navPostgres.hidden = true;
     if (navCassandra) navCassandra.hidden = true;
+    clearWorkloadNavDisabledState();
     footerSession.textContent = "Session: unknown";
   }
 }
@@ -448,10 +622,15 @@ function setActiveNav() {
   });
 }
 
-/** @param {{ index: number, variant: "topic" | "group" }} pick */
+/** @param {{ index: number, variant: "topic" | "group" | "es_index" }} pick */
 function kafkaPickCellInner(cell, ci, pick) {
   if (!pick || pick.index !== ci) return esc(cell == null ? "" : String(cell));
   const enc = encodeURIComponent(String(cell ?? ""));
+  if (pick.variant === "es_index") {
+    return `<button type="button" class="cell-link js-es-pick-index" data-name="${enc}" title="${esc(
+      "Use this value as the index pattern",
+    )}">${esc(cell == null ? "" : String(cell))}</button>`;
+  }
   const cls = pick.variant === "group" ? "js-kafka-pick-group" : "js-kafka-pick-topic";
   const label = pick.variant === "group" ? "Use this consumer group" : "Use this topic for describe / offsets";
   return `<button type="button" class="cell-link ${cls}" data-name="${enc}" title="${esc(label)}">${esc(
@@ -464,8 +643,8 @@ function kafkaDataRowHtml(cells, table) {
   const pickCol = table.getAttribute("data-pick-col");
   const pickVar = table.getAttribute("data-pick-variant");
   const pick =
-    pickCol != null && pickCol !== "" && (pickVar === "topic" || pickVar === "group")
-      ? { index: Number.parseInt(pickCol, 10), variant: /** @type {"topic"|"group"} */ (pickVar) }
+    pickCol != null && pickCol !== "" && (pickVar === "topic" || pickVar === "group" || pickVar === "es_index")
+      ? { index: Number.parseInt(pickCol, 10), variant: /** @type {"topic"|"group"|"es_index"} */ (pickVar) }
       : null;
   return `<tr>${cells
     .map((c, ci) => {
@@ -729,12 +908,13 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
 }
 
 /**
- * @param {{ spanAll?: boolean, topicsFilters?: boolean, extraPanelClass?: string, actionButtonText?: string }} opts
+ * @param {{ spanAll?: boolean, topicsFilters?: boolean, extraPanelClass?: string, actionButtonText?: string, beforeBodyHtml?: string }} opts
  */
 function panelCard(title, bodyElId, opts = {}) {
   const span = opts.spanAll ? " panel--span-all" : "";
   const extra = opts.extraPanelClass ? ` ${opts.extraPanelClass}` : "";
   const actionLabel = opts.actionButtonText || "Refresh";
+  const beforeBody = typeof opts.beforeBodyHtml === "string" ? opts.beforeBodyHtml : "";
   let filters = "";
   if (opts.topicsFilters) {
     filters = `
@@ -758,9 +938,39 @@ function panelCard(title, bodyElId, opts = {}) {
         </div>
       </div>
       ${filters}
+      ${beforeBody}
       <div id="${esc(bodyElId)}"></div>
     </section>
   `;
+}
+
+/** Index pattern fields for Elasticsearch / OpenSearch pages (``idPx`` = ``es`` or ``os``). */
+function getSearchIndexPatternValue(idPx) {
+  const a = document.getElementById(`${idPx}-index-pattern`)?.value?.trim() ?? "";
+  if (a) return a;
+  return document.getElementById(`${idPx}-index-pattern-shards`)?.value?.trim() ?? "";
+}
+
+function setSearchIndexPatternBoth(idPx, value) {
+  const v = String(value ?? "");
+  const a = document.getElementById(`${idPx}-index-pattern`);
+  const b = document.getElementById(`${idPx}-index-pattern-shards`);
+  if (a) a.value = v;
+  if (b) b.value = v;
+}
+
+function wireSearchIndexPatternSync(idPx) {
+  const a = document.getElementById(`${idPx}-index-pattern`);
+  const b = document.getElementById(`${idPx}-index-pattern-shards`);
+  if (!a || !b) return;
+  const syncA = () => {
+    b.value = a.value;
+  };
+  const syncB = () => {
+    a.value = b.value;
+  };
+  a.addEventListener("input", syncA);
+  b.addEventListener("input", syncB);
 }
 
 /**
@@ -806,6 +1016,127 @@ function toggleAwsProfileRow() {
 /** Home “List clusters”: only show names ending with ``-core`` (e.g. ``dev-mt-eks-core``). */
 function filterCoreClusters(clusters) {
   return (clusters || []).filter((c) => String(c?.name || "").endsWith("-core"));
+}
+
+/** @param {unknown} row */
+function normalizeHomeClusterRow(row) {
+  const r = row && typeof row === "object" ? /** @type {Record<string, unknown>} */ (row) : {};
+  return {
+    name: String(r.name || ""),
+    resourceGroup: String(r.resourceGroup || ""),
+    location: String(r.location || ""),
+    cloud: r.cloud === "azure" ? "azure" : "aws",
+  };
+}
+
+/**
+ * @param {HTMLSelectElement} cSel
+ * @param {Array<Record<string, unknown>>} list
+ * @param {HTMLElement | null} listStatus
+ * @param {{ restored?: boolean }} [opts]
+ */
+function populateHomeClusterSelect(cSel, list, listStatus, opts) {
+  const restored = !!opts?.restored;
+  if (!list.length) {
+    cSel.innerHTML = '<option value="">(no *-core clusters in this region)</option>';
+    if (listStatus) {
+      listStatus.textContent = restored
+        ? "Restored list was empty (no *-core clusters)."
+        : "No *-core clusters in this region.";
+      listStatus.className = "list-clusters-status muted";
+    }
+    return;
+  }
+  cSel.innerHTML = '<option value="">— Select a cluster —</option>';
+  list.forEach((c, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    const loc = c.location ? ` (${c.location})` : "";
+    const rg = c.resourceGroup ? ` [${c.resourceGroup}]` : "";
+    o.textContent = `${String(c.cloud).toUpperCase()}: ${c.name}${rg}${loc}`;
+    cSel.appendChild(o);
+  });
+  if (listStatus) {
+    listStatus.textContent = restored
+      ? `Restored ${list.length} *-core cluster(s) from last list in this tab.`
+      : `Listed ${list.length} *-core cluster(s) (others omitted).`;
+    listStatus.className = "list-clusters-status list-clusters-status--ok";
+  }
+}
+
+function readHomeClusterListSession() {
+  try {
+    const t = sessionStorage.getItem(HOME_CLUSTER_LIST_KEY);
+    if (!t) return null;
+    const o = JSON.parse(t);
+    if (!o || typeof o !== "object") return null;
+    if (typeof o.cloud !== "string" || typeof o.region !== "string") return null;
+    if (!Array.isArray(o.clusters)) return null;
+    return {
+      cloud: o.cloud,
+      region: o.region,
+      aws_profile: typeof o.aws_profile === "string" ? o.aws_profile : "",
+      clusters: o.clusters.map(normalizeHomeClusterRow),
+      selectedName: typeof o.selectedName === "string" ? o.selectedName : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {string} cloud
+ * @param {string} region
+ * @param {string} aws_profile
+ * @param {Array<Record<string, unknown>>} list
+ * @param {string} selectedName
+ */
+function saveHomeClusterListSession(cloud, region, aws_profile, list, selectedName) {
+  try {
+    sessionStorage.setItem(
+      HOME_CLUSTER_LIST_KEY,
+      JSON.stringify({
+        cloud,
+        region,
+        aws_profile,
+        clusters: list.map(normalizeHomeClusterRow),
+        selectedName: selectedName || "",
+      }),
+    );
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function persistHomeClusterSelectedNameFromUi() {
+  const cloudSel = document.getElementById("cloud-select");
+  const regionSel = document.getElementById("region-select");
+  const prSel = document.getElementById("aws-profile");
+  const cache = readHomeClusterListSession();
+  if (!cache || !cloudSel || !regionSel || !prSel) return;
+  if (cache.cloud !== cloudSel.value || cache.region !== regionSel.value || cache.aws_profile !== prSel.value.trim()) return;
+  const idxRaw = document.getElementById("cluster-select")?.value;
+  const idx = idxRaw === "" || idxRaw == null ? NaN : Number.parseInt(String(idxRaw), 10);
+  const name = !Number.isNaN(idx) && clustersList[idx] ? String(clustersList[idx].name || "") : "";
+  saveHomeClusterListSession(cache.cloud, cache.region, cache.aws_profile, clustersList, name);
+}
+
+function tryRestoreHomeClusterListFromSession() {
+  const cloudSel = document.getElementById("cloud-select");
+  const regionSel = document.getElementById("region-select");
+  const prSel = document.getElementById("aws-profile");
+  const cSel = document.getElementById("cluster-select");
+  const listStatus = document.getElementById("list-clusters-status");
+  if (!cloudSel || !regionSel || !prSel || !cSel) return;
+  const cache = readHomeClusterListSession();
+  if (!cache) return;
+  if (cache.cloud !== cloudSel.value || cache.region !== regionSel.value || cache.aws_profile !== prSel.value.trim()) return;
+  clustersList = cache.clusters;
+  populateHomeClusterSelect(/** @type {HTMLSelectElement} */ (cSel), clustersList, listStatus, { restored: true });
+  if (cache.selectedName) {
+    const ix = clustersList.findIndex((c) => c.name === cache.selectedName);
+    if (ix >= 0) cSel.value = String(ix);
+  }
 }
 
 function buildConnectPayload() {
@@ -960,6 +1291,7 @@ function renderHome() {
     document.getElementById("namespace-hint").value = def.namespace || "";
     document.getElementById("cluster-typed").value = def.aws_cluster_name || "";
     toggleAwsProfileRow();
+    tryRestoreHomeClusterListFromSession();
   })();
 
   cloudSel.addEventListener("change", toggleAwsProfileRow);
@@ -967,6 +1299,7 @@ function renderHome() {
   app.querySelector("#cluster-select")?.addEventListener("change", () => {
     const typed = app.querySelector("#cluster-typed");
     if (typed) typed.value = "";
+    persistHomeClusterSelectedNameFromUi();
   });
 
   const listStatus = app.querySelector("#list-clusters-status");
@@ -988,26 +1321,24 @@ function renderHome() {
         body: JSON.stringify({ cloud, region, aws_profile }),
       });
       clustersList = filterCoreClusters(j.clusters || []);
-      cSel.innerHTML = '<option value="">— Select a cluster —</option>';
-      clustersList.forEach((c, i) => {
-        const o = document.createElement("option");
-        o.value = String(i);
-        const loc = c.location ? ` (${c.location})` : "";
-        const rg = c.resourceGroup ? ` [${c.resourceGroup}]` : "";
-        o.textContent = `${c.cloud.toUpperCase()}: ${c.name}${rg}${loc}`;
-        cSel.appendChild(o);
-      });
-      if (!clustersList.length) {
-        cSel.innerHTML = '<option value="">(no *-core clusters in this region)</option>';
+      populateHomeClusterSelect(/** @type {HTMLSelectElement} */ (cSel), clustersList, listStatus);
+      let selName = "";
+      const prev = readHomeClusterListSession();
+      if (
+        prev &&
+        prev.cloud === cloud &&
+        prev.region === region &&
+        prev.aws_profile === aws_profile &&
+        prev.selectedName &&
+        clustersList.some((c) => String(c.name) === prev.selectedName)
+      ) {
+        selName = prev.selectedName;
       }
-      if (listStatus) {
-        listStatus.textContent = clustersList.length
-          ? `Listed ${clustersList.length} *-core cluster(s) (others omitted).`
-          : "No *-core clusters in this region.";
-        listStatus.className = clustersList.length
-          ? "list-clusters-status list-clusters-status--ok"
-          : "list-clusters-status muted";
+      if (selName) {
+        const ix = clustersList.findIndex((c) => String(c.name) === selName);
+        if (ix >= 0) cSel.value = String(ix);
       }
+      saveHomeClusterListSession(cloud, region, aws_profile, clustersList, selName);
     } catch (e) {
       cSel.innerHTML = `<option value="">${esc(e.message || "list failed")}</option>`;
       if (listStatus) {
@@ -1345,23 +1676,33 @@ function renderClickhouse() {
   wireWorkloadLogs(app, "clickhouse");
 }
 
-function appendElasticsearchToolbarParams(u) {
-  u.searchParams.set("es_pod", document.getElementById("es-pod-select")?.value ?? "0");
-  u.searchParams.set("idx_health", document.querySelector('input[name="es-idx-health"]:checked')?.value ?? "all");
-  u.searchParams.set("idx_state", document.querySelector('input[name="es-idx-state"]:checked')?.value ?? "all");
-  const sub = document.getElementById("es-idx-substring")?.value?.trim() ?? "";
+/** @param {SearchPageCfg} cfg */
+function appendSearchEngineToolbarParams(cfg, u) {
+  const px = cfg.idPx;
+  u.searchParams.set(cfg.qsPod, document.getElementById(`${px}-pod-select`)?.value ?? "0");
+  u.searchParams.set("idx_health", document.querySelector(`input[name="${px}-idx-health"]:checked`)?.value ?? "all");
+  u.searchParams.set("idx_state", document.querySelector(`input[name="${px}-idx-state"]:checked`)?.value ?? "all");
+  const sub = document.getElementById(`${px}-idx-substring`)?.value?.trim() ?? "";
   if (sub) u.searchParams.set("idx_substring", sub);
-  const alloc = document.getElementById("es-alloc-body")?.value ?? "{}";
+  const shardSub = document.getElementById(`${px}-shards-substring`)?.value?.trim() ?? "";
+  if (shardSub) u.searchParams.set("shards_substring", shardSub);
+  const alloc = document.getElementById(`${px}-alloc-body`)?.value ?? "{}";
   u.searchParams.set("alloc_body", alloc);
-  const ip = document.getElementById("es-index-pattern")?.value?.trim() ?? "";
+  const ip = getSearchIndexPatternValue(px);
   if (ip) u.searchParams.set("index_pattern", ip);
 }
 
-async function loadEsPanel(panelId, elOut) {
-  const u = new URL("/api/elasticsearch/panel", location.origin);
+/**
+ * @param {SearchPageCfg} cfg
+ * @returns {Promise<boolean>}
+ */
+async function loadSearchEnginePanel(cfg, panelId, elOut) {
+  const u = new URL(cfg.apiPanel, location.origin);
   u.searchParams.set("panel", panelId);
-  appendElasticsearchToolbarParams(u);
+  appendSearchEngineToolbarParams(cfg, u);
+  const indexPat = getSearchIndexPatternValue(cfg.idPx);
   elOut.innerHTML = "<p class='muted'>Loading…</p>";
+  const pfx = cfg.panelPx;
   try {
     const j = await fetchJson(u.toString());
     if (!j.ok) {
@@ -1370,151 +1711,318 @@ async function loadEsPanel(panelId, elOut) {
         .join("\n\n");
       elOut.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(blob)}`;
       bindCopyButtons(elOut);
-      return;
+      return false;
     }
     let inner = "";
-    if (j.cmd_hint) inner += `<p class="panel-cmd-hint">${esc(j.cmd_hint)}</p>`;
+    if (j.cmd_hint) {
+      inner += `<p class="panel-cmd-hint panel-cmd-hint--rich">${formatEsIndexHighlight(j.cmd_hint, indexPat)}</p>`;
+    }
     if (j.path_executed) {
-      inner += `<p class="hint ch-sql-hint">${esc(String(j.http_method || "GET"))} ${esc(String(j.path_executed))}</p>`;
+      inner += `<p class="hint ch-sql-hint es-path-hint">${formatEsIndexHighlight(
+        `${String(j.http_method || "GET")} ${String(j.path_executed)}`,
+        indexPat,
+      )}</p>`;
+    }
+    if (j.table && j.table.length) {
+      const pickIdx =
+        panelId === `${pfx}cat_indices` ||
+        panelId === `${pfx}cat_indices_named` ||
+        panelId === `${pfx}cat_shards` ||
+        panelId === `${pfx}cat_shards_named`
+          ? { index: 0, variant: "es_index" }
+          : null;
+      const sortNum =
+        panelId === `${pfx}cat_indices` || panelId === `${pfx}cat_indices_named`
+          ? [3, 4]
+          : panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named`
+            ? [4, 5]
+            : [];
+      const strIdx = panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named` ? [0, 1] : [];
+      inner += kafkaTopicDataTableScroll(
+        renderTable(j.table, {
+          theadFirstRow: true,
+          tableClass: "es-cat-table",
+          pickColumn: pickIdx || undefined,
+          sortableColumnIndexes: sortNum,
+          stringSortableColumnIndexes: strIdx.length ? strIdx : [],
+        }),
+      );
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
     inner += kafkaPreWithWrapFooter(blobOut);
     inner += `<p class='hint'>HTTP via pod ${esc(String(j.pod || ""))}</p>`;
     elOut.innerHTML = inner;
     bindCopyButtons(elOut);
+    if (
+      [cfg.panelPx + "cat_indices", cfg.panelPx + "cat_indices_named", cfg.panelPx + "cat_shards", cfg.panelPx + "cat_shards_named"].includes(
+        panelId,
+      )
+    ) {
+      const wrap = elOut.querySelector(".kafka-topic-table-scroll");
+      if (wrap) wireKafkaTableHeaderSort(wrap);
+    }
+    return true;
   } catch (e) {
     const d = e.detail || {};
     const blob = JSON.stringify(d, null, 2);
     elOut.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${kafkaPreWithWrapFooter(blob)}`;
     bindCopyButtons(elOut);
+    return false;
   }
 }
 
 /**
- * @param {{ needsIndexPattern?: boolean }} opts
+ * @param {SearchPageCfg} cfg
+ * @param {{ needsIndexPattern?: boolean, skipInitialLoad?: boolean, switchToRefreshAfterOk?: boolean }} opts
  */
-function wireEsPanelRefresh(root, bodyElId, panelId, opts) {
+function wireSearchEnginePanelRefresh(cfg, root, bodyElId, panelId, opts = {}) {
   const needsIndex = !!opts.needsIndexPattern;
+  const skipInitial = !!opts.skipInitialLoad;
+  const flip = !!opts.switchToRefreshAfterOk;
   const btn = root.querySelector(`[data-refresh="${bodyElId}"]`);
   const out = root.querySelector(`#${bodyElId}`);
-  const run = () => {
-    if (needsIndex && !document.getElementById("es-index-pattern")?.value?.trim()) {
-      out.innerHTML = "<p class='muted'>Enter an <strong>index pattern</strong> in the toolbar (for the named <code>/_cat/indices/&lt;index&gt;</code> panel), then Refresh.</p>";
+  if (!btn || !out) return;
+  const actionHint = () => (btn.textContent ? String(btn.textContent) : "Refresh");
+  const run = async () => {
+    if (needsIndex && !getSearchIndexPatternValue(cfg.idPx)) {
+      out.innerHTML = `<p class='muted'>Enter an <strong>index pattern</strong> (Indices toolbar or Cat shards panel), then click <strong>${actionHint()}</strong>.</p>`;
       return;
     }
-    loadEsPanel(panelId, out);
+    const before = String(btn.textContent);
+    const ok = await loadSearchEnginePanel(cfg, panelId, out);
+    if (flip && ok && before === "Activate") btn.textContent = "Refresh";
   };
-  btn.addEventListener("click", run);
-  if (needsIndex) {
-    out.innerHTML = "<p class='muted'>Enter index pattern in the toolbar, then click <strong>Refresh</strong>.</p>";
+  btn.addEventListener("click", () => void run());
+  if (skipInitial) {
+    out.innerHTML = `<p class='muted'>Set options in the <strong>Indices</strong> or <strong>Shards</strong> toolbar if needed, then click <strong>Activate</strong>.</p>`;
   } else {
-    run();
+    void run();
   }
 }
 
-function renderElasticsearch() {
+/**
+ * @param {"elasticsearch" | "opensearch"} engineKey
+ */
+function renderSearchEnginePage(engineKey) {
+  const cfg = SEARCH_PAGE_CFGS[engineKey];
+  if (!cfg) return;
+  const px = cfg.idPx;
+  const p = cfg.panelPx;
+
   if (!sessionVerified) {
-    app.innerHTML =
-      "<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The Elasticsearch page requires a verified session.</div>";
+    app.innerHTML = `<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The ${esc(
+      cfg.pageName,
+    )} page requires a verified session.</div>`;
     return;
   }
+
   app.innerHTML = `
     <p class="muted">
-      Uses <code>kubectl exec</code> on <code>glassbox-elasticsearch-master-&lt;n&gt;</code> container <code>elasticsearch</code> (override with env <code>GB_STS_ES_CONTAINER</code> if your chart differs)
-      and <code>curl</code> to <code>http://127.0.0.1:9200</code> — no port-forward.
+      Uses <code>kubectl exec</code> on <code>${esc(cfg.podStem)}-&lt;n&gt;</code> container <code>${esc(cfg.containerLabel)}</code> (override with env <code>${esc(
+    cfg.containerEnv,
+  )}</code> if your chart differs)
+      and <code>curl</code> to <code>http://127.0.0.1:9200</code> — same HTTP API style as Elasticsearch; no port-forward.
     </p>
     <section class="panel">
-      <h2>Elasticsearch parameters</h2>
+      <h2>${esc(cfg.pageName)} parameters</h2>
       <div class="ch-toolbar form-grid-wide">
         <label class="field">
           <span>Pod</span>
-          <select class="text" id="es-pod-select"><option value="0">glassbox-elasticsearch-master-0</option></select>
-        </label>
-        <label class="field" style="min-width:16rem;">
-          <span>Index pattern (named cat indices panel)</span>
-          <input class="text" id="es-index-pattern" type="text" placeholder="glassbox_singledim_agguser_week_2915" autocomplete="off" />
+          <select class="text" id="${px}-pod-select"><option value="0">${esc(cfg.podStem)}-0</option></select>
         </label>
       </div>
-      <fieldset class="es-fieldset">
-        <legend>Cat indices panel — filters (health / open / name)</legend>
-        <p class="hint" style="margin-top:0;">Applied when you refresh <strong>Cat indices (filtered JSON)</strong>. Red indices are unhealthy.</p>
+    </section>
+
+    <section class="kafka-subject" aria-labelledby="${px}-subject-cluster">
+      <h2 class="kafka-subject-title" id="${px}-subject-cluster">Cluster</h2>
+      <div class="panels-grid" id="${px}-grid-cluster"></div>
+    </section>
+
+    <section class="kafka-subject" aria-labelledby="${px}-subject-indices">
+      <h2 class="kafka-subject-title" id="${px}-subject-indices">Indices</h2>
+      <section class="panel es-indices-toolbar-panel">
+        <h3 class="es-subject-toolbar-title">Cat indices — filters</h3>
+        <p class="hint" style="margin-top:0;">Applied to <strong>Cat indices (filtered JSON)</strong> and recovery table row filter. Red rows are unhealthy indices.</p>
         <div class="es-radio-row">
           <span class="es-radio-label">Health:</span>
-          <label><input type="radio" name="es-idx-health" value="all" checked /> all</label>
-          <label><input type="radio" name="es-idx-health" value="green" /> green</label>
-          <label><input type="radio" name="es-idx-health" value="yellow" /> yellow</label>
-          <label><input type="radio" name="es-idx-health" value="red" /> red</label>
+          <label><input type="radio" name="${px}-idx-health" value="all" checked /> all</label>
+          <label><input type="radio" name="${px}-idx-health" value="green" /> green</label>
+          <label><input type="radio" name="${px}-idx-health" value="yellow" /> yellow</label>
+          <label><input type="radio" name="${px}-idx-health" value="red" /> red</label>
         </div>
         <div class="es-radio-row">
           <span class="es-radio-label">State:</span>
-          <label><input type="radio" name="es-idx-state" value="all" checked /> all</label>
-          <label><input type="radio" name="es-idx-state" value="open" /> open</label>
-          <label><input type="radio" name="es-idx-state" value="close" /> closed</label>
+          <label><input type="radio" name="${px}-idx-state" value="all" checked /> all</label>
+          <label><input type="radio" name="${px}-idx-state" value="open" /> open</label>
+          <label><input type="radio" name="${px}-idx-state" value="close" /> closed</label>
         </div>
         <label class="field" style="margin-top:0.5rem;">
           <span>Index name contains</span>
-          <input class="text" id="es-idx-substring" type="text" placeholder="substring or * pattern fragment" maxlength="200" autocomplete="off" />
+          <input class="text" id="${px}-idx-substring" type="text" placeholder="substring or * pattern fragment" maxlength="200" autocomplete="off" />
         </label>
-      </fieldset>
-      <label class="field" style="margin-top:0.75rem;">
-        <span>Allocation explain JSON body (<code>POST /_cluster/allocation/explain</code>)</span>
-        <textarea id="es-alloc-body" spellcheck="false" rows="3" class="text" style="font-family:var(--mono); min-height:4rem;">{}</textarea>
-      </label>
+        <label class="field" style="margin-top:0.75rem;">
+          <span>Index pattern (named indices, highlights, custom GET)</span>
+          <input class="text" id="${px}-index-pattern" type="text" placeholder="glassbox_singledim_agguser_week_2915" autocomplete="off" />
+        </label>
+      </section>
+      <div class="panels-grid" id="${px}-grid-indices"></div>
     </section>
-    <div class="panels-grid" id="es-panels"></div>
+
+    <section class="kafka-subject" aria-labelledby="${px}-subject-shards">
+      <h2 class="kafka-subject-title" id="${px}-subject-shards">Shards</h2>
+      <section class="panel es-shards-toolbar-panel">
+        <h3 class="es-subject-toolbar-title">Shard tables — row filter</h3>
+        <p class="hint">Optional substring match on shard / recovery / shard-store table rows (server-side, case-insensitive).</p>
+        <label class="field">
+          <span>Shard row contains</span>
+          <input class="text" id="${px}-shards-substring" type="text" placeholder="substring" maxlength="200" autocomplete="off" />
+        </label>
+      </section>
+      <div class="panels-grid" id="${px}-grid-shards"></div>
+    </section>
+
+    <section class="kafka-subject" aria-labelledby="${px}-subject-stats">
+      <h2 class="kafka-subject-title" id="${px}-subject-stats">Stats</h2>
+      <div class="panels-grid" id="${px}-grid-stats"></div>
+    </section>
+
+    <section class="kafka-subject" aria-labelledby="${px}-subject-others">
+      <h2 class="kafka-subject-title" id="${px}-subject-others">Others</h2>
+      <div class="panels-grid" id="${px}-grid-others"></div>
+    </section>
+
     <section class="panel exec-box">
       <h2>Custom GET path</h2>
       <p class="muted">Read-only GET only. Path must start with <code>/</code>. Some paths require confirmation if not on the conservative allowlist.</p>
       <label class="field">
         <span>Path and query (e.g. <code>/_cluster/health?pretty</code>)</span>
-        <input class="text" id="es-exec-path" type="text" placeholder="/_cluster/health?pretty" autocomplete="off" />
+        <input class="text" id="${px}-exec-path" type="text" placeholder="/_cluster/health?pretty" autocomplete="off" />
       </label>
       <p style="margin-top:0.75rem;">
-        <button type="button" class="btn btn-primary" id="es-exec-run">Run GET</button>
-        <button type="button" class="btn btn-danger" id="es-exec-run-confirmed" hidden>Run with confirmation</button>
+        <button type="button" class="btn btn-primary" id="${px}-exec-run">Run GET</button>
+        <button type="button" class="btn btn-danger" id="${px}-exec-run-confirmed" hidden>Run with confirmation</button>
       </p>
-      <div id="es-exec-out-wrap" class="exec-out-wrap" hidden>
-        <div id="es-exec-out-inner"></div>
+      <div id="${px}-exec-out-wrap" class="exec-out-wrap" hidden>
+        <div id="${px}-exec-out-inner"></div>
         <div class="panel-output-footer">
-          <label class="exec-json-chk"><input type="checkbox" id="es-exec-json" /> json</label>
+          <label class="exec-json-chk"><input type="checkbox" id="${px}-exec-json" /> json</label>
         </div>
       </div>
     </section>
-    ${workloadLogsPanelHtml("elasticsearch", "Elasticsearch logs")}
+    ${workloadLogsPanelHtml(cfg.workloadLogs, `${cfg.pageName} logs`)}
   `;
-  const grid = app.querySelector("#es-panels");
-  /** @type {Array<[string, string, string, boolean]>} */
-  const esPanels = [
-    ["Cluster root (version)", "es_root", "es-p-root", false],
-    ["Cluster health", "es_cluster_health", "es-p-health", false],
-    ["Cat nodes", "es_cat_nodes", "es-p-nodes", false],
-    ["Cluster settings", "es_cluster_settings", "es-p-set", false],
-    ["Cat allocation", "es_cat_allocation", "es-p-alloc", false],
-    ["Allocation explain (POST)", "es_allocation_explain", "es-p-expl", false],
-    ["Cat indices (filtered JSON)", "es_cat_indices", "es-p-idx", false],
-    ["Cat indices / named index", "es_cat_indices_named", "es-p-idxn", true],
-    ["Cat shards", "es_cat_shards", "es-p-shards", false],
-    ["Cluster stats", "es_cluster_stats", "es-p-cstats", false],
-    ["Nodes stats", "es_nodes_stats", "es-p-nstats", false],
-    ["Cat pending tasks", "es_cat_pending_tasks", "es-p-cpt", false],
-    ["Cluster pending tasks", "es_cluster_pending_tasks", "es-p-cpnd", false],
-    ["Cat thread pool", "es_cat_thread_pool", "es-p-tp", false],
-    ["ILM status", "es_ilm_status", "es-p-ilm", false],
-    ["Cat templates", "es_cat_templates", "es-p-tpl", false],
-    ["Cat aliases", "es_cat_aliases", "es-p-al", false],
-    ["Cluster state (metadata slice)", "es_cluster_state_metadata", "es-p-csm", false],
-    ["Nodes info", "es_nodes_info", "es-p-ni", false],
+
+  /**
+   * @param {HTMLElement | null} grid
+   * @param {Array<[string, string, string]>} rows
+   * @param {Record<string, { needsIndexPattern?: boolean, skipInitialLoad?: boolean, switchToRefreshAfterOk?: boolean }>} refreshOpts
+   * @param {(pid: string, bid: string) => Record<string, string>} [getCardExtras]
+   */
+  function fillSearchSubjectGrid(grid, rows, refreshOpts, getCardExtras) {
+    if (!grid) return;
+    let html = "";
+    for (const row of rows) {
+      const [title, pid, bid] = row;
+      const ro = refreshOpts[pid] || {};
+      const useActivate = !!(ro.skipInitialLoad && ro.switchToRefreshAfterOk);
+      const extras = typeof getCardExtras === "function" ? getCardExtras(pid, bid) : {};
+      html += panelCard(title, bid, { actionButtonText: useActivate ? "Activate" : "Refresh", ...extras });
+    }
+    grid.innerHTML = html;
+    for (const row of rows) {
+      const [, pid, bid] = row;
+      wireSearchEnginePanelRefresh(cfg, grid, bid, pid, refreshOpts[pid] || {});
+    }
+  }
+
+  const allocBodyHtml = `
+      <label class="field" style="margin-top:0;">
+        <span>Allocation explain JSON body (<code>POST /_cluster/allocation/explain</code>)</span>
+        <textarea id="${px}-alloc-body" spellcheck="false" rows="3" class="text" style="font-family:var(--mono); min-height:4rem;">{}</textarea>
+      </label>`;
+  const catShardsToolbarHtml = `
+      <div class="panel-toolbar es-cat-shards-toolbar">
+        <label class="field">
+          <span>Index pattern (shard-by-index, highlights)</span>
+          <input class="text" id="${px}-index-pattern-shards" type="text" placeholder="Synced with Indices toolbar" autocomplete="off" />
+        </label>
+      </div>`;
+
+  const clusterPanels = [
+    ["Cluster root (version)", `${p}root`, `${px}-p-root`],
+    ["Cluster health", `${p}cluster_health`, `${px}-p-health`],
+    ["Cat nodes", `${p}cat_nodes`, `${px}-p-nodes`],
+    ["Cluster settings", `${p}cluster_settings`, `${px}-p-set`],
+    ["Cat allocation", `${p}cat_allocation`, `${px}-p-alloc`],
+    ["Allocation explain (POST)", `${p}allocation_explain`, `${px}-p-expl`],
   ];
-  let html = "";
-  for (const row of esPanels) {
-    const [title, , bid] = row;
-    html += panelCard(title, bid);
+  const indicesPanels = [
+    ["Cat indices (filtered JSON)", `${p}cat_indices`, `${px}-p-idx`],
+    ["Cat indices / named index", `${p}cat_indices_named`, `${px}-p-idxn`],
+    ["Cat recovery (JSON)", `${p}cat_recovery`, `${px}-p-rec`],
+  ];
+  const shardsPanels = [
+    ["Cat shards", `${p}cat_shards`, `${px}-p-shards`],
+    ["Cat shard stores (JSON)", `${p}cat_shard_stores`, `${px}-p-sstores`],
+    ["Cluster health (shard level)", `${p}cluster_health_shards`, `${px}-p-chs`],
+    ["Cat shards / index pattern", `${p}cat_shards_named`, `${px}-p-shn`],
+  ];
+  const statsPanels = [
+    ["Cluster stats", `${p}cluster_stats`, `${px}-p-cstats`],
+    ["Nodes stats", `${p}nodes_stats`, `${px}-p-nstats`],
+    ["Cat pending tasks", `${p}cat_pending_tasks`, `${px}-p-cpt`],
+    ["Cluster pending tasks", `${p}cluster_pending_tasks`, `${px}-p-cpnd`],
+    ["Cat thread pool", `${p}cat_thread_pool`, `${px}-p-tp`],
+    ["ILM status", `${p}ilm_status`, `${px}-p-ilm`],
+  ];
+  const othersPanels = [
+    ["Cat templates", `${p}cat_templates`, `${px}-p-tpl`],
+    ["Cat aliases", `${p}cat_aliases`, `${px}-p-al`],
+    ["Cluster state (metadata slice)", `${p}cluster_state_metadata`, `${px}-p-csm`],
+    ["Nodes info", `${p}nodes_info`, `${px}-p-ni`],
+  ];
+
+  const clusterRefresh = {
+    [`${p}allocation_explain`]: { skipInitialLoad: true, switchToRefreshAfterOk: true },
+  };
+  const indicesRefresh = {
+    [`${p}cat_indices`]: { skipInitialLoad: true, switchToRefreshAfterOk: true },
+    [`${p}cat_indices_named`]: { needsIndexPattern: true, skipInitialLoad: true, switchToRefreshAfterOk: true },
+    [`${p}cat_recovery`]: {},
+  };
+  const shardsRefresh = {
+    [`${p}cat_shards_named`]: { needsIndexPattern: true, skipInitialLoad: true, switchToRefreshAfterOk: true },
+  };
+
+  fillSearchSubjectGrid(app.querySelector(`#${px}-grid-cluster`), clusterPanels, clusterRefresh, (pid, bid) =>
+    bid === `${px}-p-expl` ? { beforeBodyHtml: allocBodyHtml } : {},
+  );
+  fillSearchSubjectGrid(app.querySelector(`#${px}-grid-indices`), indicesPanels, indicesRefresh);
+  fillSearchSubjectGrid(app.querySelector(`#${px}-grid-shards`), shardsPanels, shardsRefresh, (pid, bid) =>
+    bid === `${px}-p-shards` ? { beforeBodyHtml: catShardsToolbarHtml } : {},
+  );
+  fillSearchSubjectGrid(app.querySelector(`#${px}-grid-stats`), statsPanels, {});
+  fillSearchSubjectGrid(app.querySelector(`#${px}-grid-others`), othersPanels, {});
+
+  app.dataset.searchEngine = px;
+  if (!app.dataset.searchIndexPickDelegation) {
+    app.dataset.searchIndexPickDelegation = "1";
+    app.addEventListener("click", (ev) => {
+      const b = ev.target.closest("button.js-es-pick-index");
+      if (!b) return;
+      const idPx = app.dataset.searchEngine || "es";
+      const enc = b.getAttribute("data-name");
+      if (enc != null) {
+        try {
+          setSearchIndexPatternBoth(idPx, decodeURIComponent(enc));
+        } catch {
+          /* ignore */
+        }
+      }
+    });
   }
-  grid.innerHTML = html;
-  for (const row of esPanels) {
-    const [, pid, bid, needsIdx] = row;
-    wireEsPanelRefresh(grid, bid, pid, { needsIndexPattern: needsIdx });
-  }
+
+  wireSearchIndexPatternSync(px);
 
   (async () => {
     let stack = null;
@@ -1530,84 +2038,102 @@ function renderElasticsearch() {
         stack = null;
       }
     }
-    const rep = stack?.components?.elasticsearch?.replicas;
-    const sel = document.getElementById("es-pod-select");
+    const rep = stack?.components?.[cfg.stackComp]?.replicas;
+    const sel = document.getElementById(`${px}-pod-select`);
     if (!sel) return;
     const n = typeof rep === "number" && rep > 0 ? rep : 1;
     sel.innerHTML = "";
     for (let i = 0; i < n; i++) {
       const o = document.createElement("option");
       o.value = String(i);
-      o.textContent = `glassbox-elasticsearch-master-${i}`;
+      o.textContent = `${cfg.podStem}-${i}`;
       sel.appendChild(o);
     }
   })();
 
-  const esExecWrap = app.querySelector("#es-exec-out-wrap");
-  const esExecInner = app.querySelector("#es-exec-out-inner");
-  const esExecJson = app.querySelector("#es-exec-json");
-  const esConfBtn = app.querySelector("#es-exec-run-confirmed");
+  const execWrap = app.querySelector(`#${px}-exec-out-wrap`);
+  const execInner = app.querySelector(`#${px}-exec-out-inner`);
+  const execJson = app.querySelector(`#${px}-exec-json`);
+  const confBtn = app.querySelector(`#${px}-exec-run-confirmed`);
   /** @type {unknown} */
-  let lastEsExecPayload = null;
+  let lastExecPayload = null;
 
-  function renderEsExecOut(j) {
-    if (!esExecInner) return;
-    const asJson = esExecJson && esExecJson.checked;
+  function renderSearchExecOut(j) {
+    if (!execInner) return;
+    const asJson = execJson && execJson.checked;
+    const ip = getSearchIndexPatternValue(px);
+    let head = "";
+    if (!asJson && j && typeof j === "object" && j.path_executed) {
+      head = `<p class="hint ch-sql-hint es-path-hint">${formatEsIndexHighlight(
+        `${String(j.http_method || "GET")} ${String(j.path_executed)}`,
+        ip,
+      )}</p>`;
+    }
     const text = asJson ? JSON.stringify(j, null, 2) : formatExecPlainHelper(j);
-    esExecInner.innerHTML = kafkaPreWithWrapFooter(text);
-    bindCopyButtons(esExecInner);
+    execInner.innerHTML = head + kafkaPreWithWrapFooter(text);
+    bindCopyButtons(execInner);
   }
 
-  async function runEsExec(confirmed) {
-    let path = document.getElementById("es-exec-path")?.value?.trim() ?? "";
+  async function runSearchExec(confirmed) {
+    let path = document.getElementById(`${px}-exec-path`)?.value?.trim() ?? "";
     if (!path) {
-      if (esExecInner) esExecInner.innerHTML = "<p class='status-bad'>Enter a path (e.g. <code>/_cluster/health?pretty</code>).</p>";
-      esExecWrap.hidden = false;
+      if (execInner) execInner.innerHTML = "<p class='status-bad'>Enter a path (e.g. <code>/_cluster/health?pretty</code>).</p>";
+      if (execWrap) execWrap.hidden = false;
       return;
     }
     if (!path.startsWith("/")) path = `/${path}`;
-    const es_pod = Number.parseInt(String(document.getElementById("es-pod-select")?.value ?? "0"), 10) || 0;
-    esExecWrap.hidden = false;
-    if (esExecInner) esExecInner.innerHTML = "<p class='muted'>Running…</p>";
-    if (esConfBtn) esConfBtn.hidden = true;
+    const podVal = Number.parseInt(String(document.getElementById(`${px}-pod-select`)?.value ?? "0"), 10) || 0;
+    const body = /** @type {Record<string, unknown>} */ ({ path, method: "GET", confirmed });
+    body[cfg.qsPod] = podVal;
+    if (execWrap) execWrap.hidden = false;
+    if (execInner) execInner.innerHTML = "<p class='muted'>Running…</p>";
+    if (confBtn) confBtn.hidden = true;
     try {
-      const j = await fetchJson("/api/elasticsearch/exec", {
+      const j = await fetchJson(cfg.apiExec, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path, method: "GET", es_pod, confirmed }),
+        body: JSON.stringify(body),
       });
-      lastEsExecPayload = j;
+      lastExecPayload = j;
       if (j.needs_confirmation) {
-        renderEsExecOut(j);
-        if (esConfBtn) esConfBtn.hidden = false;
+        renderSearchExecOut(j);
+        if (confBtn) confBtn.hidden = false;
         return;
       }
-      renderEsExecOut(j);
+      renderSearchExecOut(j);
     } catch (e) {
       const payload = e.detail || { error: e.message };
-      lastEsExecPayload = payload;
+      lastExecPayload = payload;
       if (e.status === 409 && e.detail && e.detail.needs_confirmation) {
-        renderEsExecOut(e.detail);
-        if (esConfBtn) esConfBtn.hidden = false;
+        renderSearchExecOut(e.detail);
+        if (confBtn) confBtn.hidden = false;
         return;
       }
-      renderEsExecOut(payload);
+      renderSearchExecOut(payload);
     }
   }
 
-  if (esExecJson) {
-    esExecJson.addEventListener("change", () => {
-      if (lastEsExecPayload != null) renderEsExecOut(lastEsExecPayload);
+  if (execJson) {
+    execJson.addEventListener("change", () => {
+      if (lastExecPayload != null) renderSearchExecOut(lastExecPayload);
     });
   }
-  app.querySelector("#es-exec-run").addEventListener("click", () => runEsExec(false));
-  app.querySelector("#es-exec-run-confirmed").addEventListener("click", () => {
+  app.querySelector(`#${px}-exec-run`)?.addEventListener("click", () => runSearchExec(false));
+  app.querySelector(`#${px}-exec-run-confirmed`)?.addEventListener("click", () => {
     const ok = window.confirm(
       "The server flagged this GET path as potentially sensitive.\n\nRun it anyway? Only proceed if you accept the risk.",
     );
-    if (ok) runEsExec(true);
+    if (ok) runSearchExec(true);
   });
-  wireWorkloadLogs(app, "elasticsearch");
+  wireWorkloadLogs(app, cfg.workloadLogs);
+}
+
+function renderElasticsearch() {
+  renderSearchEnginePage("elasticsearch");
+}
+
+function renderOpensearch() {
+  renderSearchEnginePage("opensearch");
 }
 
 const PG_HISTORY_KEY = "gb_sts_pg_queries_v1";
@@ -2544,6 +3070,10 @@ ${preWithCopy(c3)}`;
 
 function route() {
   stopWorkloadLogStream();
+  if (isCurrentHashWorkloadDisabled()) {
+    location.hash = "#/";
+    return;
+  }
   setActiveNav();
   const h = location.hash || "#/";
   if (h.startsWith("#/kafka")) {
@@ -2552,6 +3082,8 @@ function route() {
     renderClickhouse();
   } else if (h.startsWith("#/elasticsearch")) {
     renderElasticsearch();
+  } else if (h.startsWith("#/opensearch")) {
+    renderOpensearch();
   } else if (h.startsWith("#/postgres")) {
     renderPostgres();
   } else if (h.startsWith("#/cassandra")) {

@@ -24,6 +24,9 @@ ELASTICSEARCH_POD_PREFIX = "glassbox-elasticsearch-master-"
 ELASTICSEARCH_CONTAINER = os.environ.get("GB_STS_ES_CONTAINER", "elasticsearch").strip() or "elasticsearch"
 ELASTICSEARCH_LOCAL = "http://127.0.0.1:9200"
 
+OPENSEARCH_POD_PREFIX = "glassbox-opensearch-master-"
+OPENSEARCH_CONTAINER = os.environ.get("GB_STS_OS_CONTAINER", "opensearch").strip() or "opensearch"
+
 # Glassbox chart uses this container name (Bitnami chart default is often ``postgresql``).
 POSTGRES_CONTAINER = os.environ.get("GB_STS_PG_CONTAINER", "glassbox-postgresql").strip() or "glassbox-postgresql"
 CASSANDRA_CONTAINER = os.environ.get("GB_STS_CASS_CONTAINER", "cassandra").strip() or "cassandra"
@@ -69,9 +72,10 @@ def sanitize_kafka_logs_container(container: str) -> str | None:
     return None
 
 
-_LOG_WORKLOADS = frozenset({"kafka", "clickhouse", "elasticsearch", "postgresql", "cassandra"})
+_LOG_WORKLOADS = frozenset({"kafka", "clickhouse", "elasticsearch", "opensearch", "postgresql", "cassandra"})
 _CH_LOG_POD = re.compile(r"^glassbox-clickhouse-(\d+)$")
 _ES_LOG_POD = re.compile(r"^glassbox-elasticsearch-master-(\d+)$")
+_OS_LOG_POD = re.compile(r"^glassbox-opensearch-master-(\d+)$")
 _PG_LOG_SINGLE = re.compile(r"^glassbox-postgresql-(\d+)$")
 _PG_LOG_HA = re.compile(r"^glassbox-postgresql-ha-postgresql-(\d+)$")
 _CASS_LOG_POD = re.compile(r"^glassbox-cassandra-(\d+)$")
@@ -91,6 +95,12 @@ def sanitize_pod_for_workload(workload: str, pod: str) -> str | None:
         return p if 0 <= i <= 31 else None
     if w == "elasticsearch":
         m = _ES_LOG_POD.match(p)
+        if not m:
+            return None
+        i = int(m.group(1))
+        return p if 0 <= i <= 31 else None
+    if w == "opensearch":
+        m = _OS_LOG_POD.match(p)
         if not m:
             return None
         i = int(m.group(1))
@@ -119,6 +129,8 @@ def sanitize_workload_logs_container(workload: str, container: str) -> str | Non
     if w == "clickhouse" and c == CLICKHOUSE_CONTAINER:
         return c
     if w == "elasticsearch" and c == ELASTICSEARCH_CONTAINER:
+        return c
+    if w == "opensearch" and c == OPENSEARCH_CONTAINER:
         return c
     if w == "postgresql" and c == POSTGRES_CONTAINER:
         return c

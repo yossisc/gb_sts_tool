@@ -41,6 +41,12 @@ pre {
   background: var(--surface);
 }
 
+.brand-block {
+  flex: 0 1 auto;
+  max-width: min(20rem, 42vw);
+  min-width: 0;
+}
+
 .brand-block h1 {
   margin: 0;
   font-size: 1.25rem;
@@ -51,11 +57,13 @@ pre {
   margin: 0.15rem 0 0 0;
   font-size: 0.85rem;
   color: var(--muted);
+  max-width: 100%;
+  text-wrap: balance;
 }
 
 .k8s-strip {
-  flex: 1 1 14rem;
-  min-width: 12rem;
+  flex: 1 1 18rem;
+  min-width: min(100%, 14rem);
   padding: 0.5rem 0.75rem;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -103,6 +111,18 @@ pre {
   font-weight: 600;
   color: var(--text);
   text-decoration: underline;
+}
+
+.nav a.nav-disabled {
+  color: var(--muted);
+  pointer-events: none;
+  cursor: not-allowed;
+  text-decoration: none;
+  opacity: 0.72;
+}
+
+.nav a.nav-disabled:hover {
+  text-decoration: none;
 }
 
 .nav-gated[hidden] {
@@ -554,6 +574,16 @@ select.text {
   font-size: 0.85rem;
 }
 
+.workload-logs-display.output-pre--nowrap {
+  overflow-x: auto;
+}
+
+.workload-logs-display.output-pre--nowrap .log-line-row {
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
 .log-line-row {
   white-space: pre-wrap;
   word-break: break-word;
@@ -563,6 +593,24 @@ mark.log-line-hit {
   background: #ffff00;
   color: #111;
   padding: 0 0.06em;
+}
+
+mark.es-index-hint-hit {
+  background: #ffff00;
+  color: #111;
+  padding: 0 0.06em;
+  font-weight: 600;
+}
+
+.es-subject-toolbar-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.35rem;
+}
+
+.es-indices-toolbar-panel,
+.es-shards-toolbar-panel {
+  margin-bottom: 1rem;
 }
 
 .query-history-list {

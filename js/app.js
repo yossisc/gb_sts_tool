@@ -25,7 +25,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.22";
+const VERSION = "1.0.23";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -578,6 +578,7 @@ async function refreshSessionUi() {
       navKafka.hidden = false;
       if (navClickhouse) navClickhouse.hidden = false;
       if (navElasticsearch) navElasticsearch.hidden = false;
+      if (navOpensearch) navOpensearch.hidden = false;
       if (navPostgres) navPostgres.hidden = false;
       if (navCassandra) navCassandra.hidden = false;
       const ap = s.session.p ? ` · AWS ${s.session.p}` : "";
@@ -593,6 +594,7 @@ async function refreshSessionUi() {
       navKafka.hidden = true;
       if (navClickhouse) navClickhouse.hidden = true;
       if (navElasticsearch) navElasticsearch.hidden = true;
+      if (navOpensearch) navOpensearch.hidden = true;
       if (navPostgres) navPostgres.hidden = true;
       if (navCassandra) navCassandra.hidden = true;
       clearWorkloadNavDisabledState();
@@ -603,6 +605,7 @@ async function refreshSessionUi() {
     navKafka.hidden = true;
     if (navClickhouse) navClickhouse.hidden = true;
     if (navElasticsearch) navElasticsearch.hidden = true;
+    if (navOpensearch) navOpensearch.hidden = true;
     if (navPostgres) navPostgres.hidden = true;
     if (navCassandra) navCassandra.hidden = true;
     clearWorkloadNavDisabledState();

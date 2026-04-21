@@ -9,6 +9,7 @@ const footerSession = document.getElementById("footer-session");
 const k8sContextEl = document.getElementById("k8s-context");
 const k8sAwsEl = document.getElementById("k8s-aws");
 const navKafka = document.getElementById("nav-kafka");
+const navKafkaConnect = document.getElementById("nav-kafka-connect");
 const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
 const navOpensearch = document.getElementById("nav-opensearch");
@@ -18,6 +19,7 @@ const navCassandra = document.getElementById("nav-cassandra");
 /** @type {Array<[HTMLElement | null, string]>} anchor → ``stack.components`` id */
 const WORKLOAD_NAV_STACK_KEYS = [
   [navKafka, "kafka"],
+  [navKafkaConnect, "kafkaconnect"],
   [navClickhouse, "clickhouse"],
   [navElasticsearch, "elasticsearch"],
   [navOpensearch, "opensearch"],
@@ -25,7 +27,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.23";
+const VERSION = "1.0.27";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -35,6 +37,7 @@ const workloadLogStream = { controller: null };
 
 const WL_STACK_COMP = {
   kafka: "kafka",
+  kafkaconnect: "kafkaconnect",
   clickhouse: "clickhouse",
   elasticsearch: "elasticsearch",
   opensearch: "opensearch",
@@ -44,6 +47,7 @@ const WL_STACK_COMP = {
 
 const WL_DEFAULT_POD = {
   kafka: "glassbox-kafka-0",
+  kafkaconnect: "glassbox-kafkaconnect-0",
   clickhouse: "glassbox-clickhouse-0",
   elasticsearch: "glassbox-elasticsearch-master-0",
   opensearch: "glassbox-opensearch-master-0",
@@ -194,6 +198,7 @@ function workloadLogContainerDefault(workload) {
   if (typeof w === "string" && w) return w;
   const fb = {
     kafka: "kafka",
+    kafkaconnect: "kafka",
     clickhouse: "glassbox-clickhouse",
     elasticsearch: "elasticsearch",
     opensearch: "opensearch",
@@ -397,11 +402,18 @@ function preWithCopy(rawText) {
   return `<div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="output-pre" id="${id}">${esc(rawText || "")}</pre></div>`;
 }
 
+/** Strip ANSI SGR sequences (e.g. ClickHouse PrettyCompact bold headers) for monospace alignment in HTML. */
+function stripAnsiSgr(text) {
+  return String(text ?? "").replace(/\u001b\[[\d;?]*[ -/]*[@-~]/g, "");
+}
+
 /** Kafka panel raw output: nowrap by default + wrap checkbox (bottom-right of block). */
 function kafkaPreWithWrapFooter(rawText, opts = {}) {
   const id = `pre-copy-${++copyBtnSeq}`;
   const wrapOn = !!opts.wrapChecked;
-  const preClass = wrapOn ? "output-pre" : "output-pre output-pre--nowrap";
+  const base = wrapOn ? "output-pre" : "output-pre output-pre--nowrap";
+  const extra = (opts.preClass || "").trim();
+  const preClass = extra ? `${base} ${extra}` : base;
   const chk = wrapOn ? " checked" : "";
   return `<div class="panel-output-stack"><div class="pre-copy-wrap"><button type="button" class="btn-copy" data-copy-target="${id}" title="Copy to clipboard" aria-label="Copy"><svg class="btn-copy-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg></button><pre class="${preClass}" id="${id}">${esc(rawText || "")}</pre></div><div class="panel-output-footer"><label class="wrap-chk"><input type="checkbox" class="js-pre-wrap" data-pre-id="${id}"${chk} /> wrap</label></div></div>`;
 }
@@ -525,18 +537,25 @@ function clearWorkloadNavDisabledState() {
   }
 }
 
+function hashMatchesRoute(hash, href) {
+  if (hash === href) return true;
+  if (!href || href === "#/") return false;
+  return hash.startsWith(`${href}/`) || hash.startsWith(`${href}?`);
+}
+
 function isCurrentHashWorkloadDisabled() {
   const h = location.hash || "#/";
   const pairs = [
+    ["#/kafka-connect", navKafkaConnect],
     ["#/kafka", navKafka],
-    ["#/clickhouse", navClickhouse],
     ["#/elasticsearch", navElasticsearch],
     ["#/opensearch", navOpensearch],
+    ["#/clickhouse", navClickhouse],
     ["#/postgres", navPostgres],
     ["#/cassandra", navCassandra],
   ];
   for (const [prefix, el] of pairs) {
-    if (h === prefix || (prefix !== "#/" && h.startsWith(prefix))) {
+    if (hashMatchesRoute(h, prefix)) {
       return !!(el && el.classList.contains("nav-disabled"));
     }
   }
@@ -576,6 +595,7 @@ async function refreshSessionUi() {
     workloadLogContainers = s.workload_log_containers && typeof s.workload_log_containers === "object" ? s.workload_log_containers : null;
     if (sessionVerified && s.session) {
       navKafka.hidden = false;
+      if (navKafkaConnect) navKafkaConnect.hidden = false;
       if (navClickhouse) navClickhouse.hidden = false;
       if (navElasticsearch) navElasticsearch.hidden = false;
       if (navOpensearch) navOpensearch.hidden = false;
@@ -592,6 +612,7 @@ async function refreshSessionUi() {
       }
     } else {
       navKafka.hidden = true;
+      if (navKafkaConnect) navKafkaConnect.hidden = true;
       if (navClickhouse) navClickhouse.hidden = true;
       if (navElasticsearch) navElasticsearch.hidden = true;
       if (navOpensearch) navOpensearch.hidden = true;
@@ -603,6 +624,7 @@ async function refreshSessionUi() {
   } catch {
     sessionVerified = false;
     navKafka.hidden = true;
+    if (navKafkaConnect) navKafkaConnect.hidden = true;
     if (navClickhouse) navClickhouse.hidden = true;
     if (navElasticsearch) navElasticsearch.hidden = true;
     if (navOpensearch) navOpensearch.hidden = true;
@@ -617,7 +639,7 @@ function setActiveNav() {
   const h = location.hash || "#/";
   document.querySelectorAll(".nav a[data-route]").forEach((a) => {
     const href = a.getAttribute("href") || "";
-    if (h === href || (href !== "#/" && h.startsWith(href))) {
+    if (hashMatchesRoute(h, href)) {
       a.classList.add("nav-active");
     } else {
       a.classList.remove("nav-active");
@@ -1452,25 +1474,54 @@ async function loadChPanel(panelId, elOut, usesEventTable) {
   if (usesEventTable) {
     u.searchParams.set("event_table", document.getElementById("ch-event-table")?.value ?? "beacon_event");
   }
+  if (panelId === "ch_explore_tables") {
+    const db = document.getElementById("ch-explore-database")?.value?.trim() ?? "glassbox";
+    u.searchParams.set("database", db);
+  }
   elOut.innerHTML = "<p class='muted'>Loading…</p>";
   try {
     const j = await fetchJson(u.toString());
     if (!j.ok) {
-      const blob = [j.error || "failed", j.stderr && `stderr:\n${j.stderr}`, j.stdout && `stdout:\n${j.stdout}`]
+      const blob = [
+        j.error || "failed",
+        j.stderr && `stderr:\n${stripAnsiSgr(j.stderr)}`,
+        j.stdout && `stdout:\n${stripAnsiSgr(j.stdout)}`,
+      ]
         .filter(Boolean)
         .join("\n\n");
-      elOut.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(blob)}`;
+      elOut.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(blob, {
+        preClass: "output-pre--ch-pretty",
+      })}`;
       bindCopyButtons(elOut);
       return;
     }
     let inner = "";
     if (j.cmd_hint) inner += `<p class="panel-cmd-hint">${esc(j.cmd_hint)}</p>`;
     if (j.sql_executed) inner += `<p class="hint ch-sql-hint">${esc(j.sql_executed)}</p>`;
-    const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
-    inner += kafkaPreWithWrapFooter(blobOut);
+    if (j.table && Array.isArray(j.table) && j.table.length) {
+      const cols = Math.max(0, j.table[0].length || 0);
+      const strCols = Array.from({ length: cols }, (_, i) => i);
+      inner += kafkaTopicDataTableScroll(
+        renderTable(j.table, {
+          theadFirstRow: true,
+          tableClass: "es-cat-table",
+          sortableColumnIndexes: [],
+          stringSortableColumnIndexes: strCols,
+        }),
+      );
+      const errBlob = j.stderr && String(j.stderr).trim() ? `--- stderr ---\n${stripAnsiSgr(j.stderr)}` : "";
+      if (errBlob) inner += kafkaPreWithWrapFooter(errBlob, { preClass: "output-pre--ch-pretty" });
+    } else {
+      const blobOut = [stripAnsiSgr(j.stdout || ""), j.stderr && `--- stderr ---\n${stripAnsiSgr(j.stderr)}`]
+        .filter(Boolean)
+        .join("\n\n");
+      inner += kafkaPreWithWrapFooter(blobOut, { preClass: "output-pre--ch-pretty" });
+    }
     inner += `<p class='hint'>exit ${esc(String(j.returncode))} · pod ${esc(String(j.pod || ""))}</p>`;
     elOut.innerHTML = inner;
     bindCopyButtons(elOut);
+    const wrap = elOut.querySelector(".kafka-topic-table-scroll");
+    if (wrap) wireKafkaTableHeaderSort(wrap);
   } catch (e) {
     const d = e.detail || {};
     const blob = JSON.stringify(d, null, 2);
@@ -1512,6 +1563,7 @@ function renderClickhouse() {
     <p class="muted">
       Queries run via <code>kubectl exec</code> on <code>glassbox-clickhouse-&lt;n&gt;</code> container <code>glassbox-clickhouse</code> using
       <code>clickhouse-client --password</code> (password from <code>data/sensitive/.ch_password</code>).
+      Output uses <code>PrettyCompact</code> formatting; default database for unqualified tables is <code>glassbox</code> (<code>GB_STS_CLICKHOUSE_DATABASE</code> on the tool server).
     </p>
     <section class="panel">
       <h2>ClickHouse parameters</h2>
@@ -1543,8 +1595,14 @@ function renderClickhouse() {
           <span>To (optional)</span>
           <input class="text" id="ch-to-ts" type="text" placeholder="2026-01-02 00:00:00" autocomplete="off" />
         </label>
+        <label class="field">
+          <span>Catalog: database (for “Tables in database” panel)</span>
+          <input class="text" id="ch-explore-database" type="text" value="glassbox" maxlength="64" autocomplete="off" />
+        </label>
       </div>
-      <p class="hint">Time filter: use <strong>Hours back</strong> for a rolling window (default last 24h), or set <strong>From</strong> and <strong>To</strong> together for an absolute range on <code>session_ts</code>.</p>
+      <p class="hint">
+        Time filter: use <strong>Hours back</strong> for a rolling window (default last 24h), or set <strong>From</strong> and <strong>To</strong> together for an absolute range on <code>session_ts</code>.
+      </p>
     </section>
     <div class="panels-grid" id="ch-panels"></div>
     <section class="panel exec-box">
@@ -1567,6 +1625,8 @@ function renderClickhouse() {
   const grid = app.querySelector("#ch-panels");
   /** @type {Array<[string, string, string, boolean, boolean]>} */
   const chPanels = [
+    ["Databases (system.databases)", "ch_explore_databases", "ch-p-db", false, false],
+    ["Tables in database (system.tables)", "ch_explore_tables", "ch-p-tbl", false, false],
     ["Max session_ts", "ch_max_session_ts", "ch-p-max", true, false],
     ["Events & sessions by hour", "ch_events_sessions_by_hour", "ch-p-ev", true, false],
     ["system.clusters (analytics)", "ch_system_clusters", "ch-p-cl", false, false],
@@ -1627,8 +1687,24 @@ function renderClickhouse() {
   function renderChExecOut(j) {
     if (!chExecInner) return;
     const asJson = chExecJson && chExecJson.checked;
-    const text = asJson ? JSON.stringify(j, null, 2) : formatChExecPlain(j);
-    chExecInner.innerHTML = kafkaPreWithWrapFooter(text);
+    if (asJson) {
+      chExecInner.innerHTML = kafkaPreWithWrapFooter(JSON.stringify(j, null, 2));
+      bindCopyButtons(chExecInner);
+      return;
+    }
+    if (j && typeof j === "object" && j.ok && j.stdout != null && String(j.stdout).trim()) {
+      const out = stripAnsiSgr(String(j.stdout));
+      let foot = `<p class="hint muted">exit ${esc(String(j.returncode ?? ""))}`;
+      if (j.pod) foot += ` · pod ${esc(String(j.pod))}`;
+      foot += "</p>";
+      if (j.stderr != null && String(j.stderr).trim()) {
+        foot += `<p class="hint">${esc(stripAnsiSgr(String(j.stderr)))}</p>`;
+      }
+      chExecInner.innerHTML = `${kafkaPreWithWrapFooter(out, { preClass: "output-pre--ch-pretty" })}${foot}`;
+      bindCopyButtons(chExecInner);
+      return;
+    }
+    chExecInner.innerHTML = kafkaPreWithWrapFooter(formatChExecPlain(j));
     bindCopyButtons(chExecInner);
   }
 
@@ -2131,6 +2207,200 @@ function renderSearchEnginePage(engineKey) {
   wireWorkloadLogs(app, cfg.workloadLogs);
 }
 
+function renderKafkaConnect() {
+  if (!sessionVerified) {
+    app.innerHTML =
+      "<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The Kafka Connect page requires a verified session.</div>";
+    return;
+  }
+  app.innerHTML = `
+    <p class="muted">
+      Uses <code>kubectl exec</code> on <code>glassbox-kafkaconnect-&lt;n&gt;</code> container <code>kafka</code> (override with env <code>GB_STS_KAFKA_CONNECT_CONTAINER</code> if your chart differs)
+      and <code>curl</code> to <code>http://127.0.0.1:8083</code> inside the pod.
+    </p>
+    <section class="panel">
+      <h2>Kafka Connect parameters</h2>
+      <div class="ch-toolbar form-grid-wide">
+        <label class="field">
+          <span>Pod</span>
+          <select class="text" id="kc-pod-select"><option value="0">glassbox-kafkaconnect-0</option></select>
+        </label>
+        <label class="field" style="min-width:22rem;">
+          <span>Connector name (for connector-specific panels)</span>
+          <input class="text" id="kc-connector-name" type="text" placeholder="s3sink-cottages" autocomplete="off" />
+        </label>
+      </div>
+    </section>
+    <section class="kafka-subject" aria-labelledby="kc-subject-overview">
+      <h2 class="kafka-subject-title" id="kc-subject-overview">Overview</h2>
+      <div class="panels-grid" id="kc-grid-overview"></div>
+    </section>
+    <section class="kafka-subject" aria-labelledby="kc-subject-connector">
+      <h2 class="kafka-subject-title" id="kc-subject-connector">Connector details</h2>
+      <div class="panels-grid" id="kc-grid-connector"></div>
+    </section>
+    <section class="kafka-subject" aria-labelledby="kc-subject-infra">
+      <h2 class="kafka-subject-title" id="kc-subject-infra">Infra</h2>
+      <div class="panels-grid" id="kc-grid-infra"></div>
+    </section>
+    ${workloadLogsPanelHtml("kafkaconnect", "Kafka Connect logs")}
+  `;
+
+  const overviewPanels = [
+    ["Root (worker info)", "kc_root", "kc-p-root", false],
+    ["Connectors list", "kc_connectors", "kc-p-connectors", false],
+    ["Connectors status", "kc_connectors_status", "kc-p-status", false],
+    ["Connectors info", "kc_connectors_info", "kc-p-info", false],
+    ["Connectors info + status", "kc_connectors_full", "kc-p-full", false],
+  ];
+  const connectorPanels = [
+    ["Connector status", "kc_connector_status", "kc-p-c-status", true],
+    ["Connector config", "kc_connector_config", "kc-p-c-config", true],
+    ["Connector tasks", "kc_connector_tasks", "kc-p-c-tasks", true],
+    ["Connector topics", "kc_connector_topics", "kc-p-c-topics", true],
+  ];
+  const infraPanels = [
+    ["Connector plugins", "kc_plugins", "kc-p-plugins", false],
+    ["Admin loggers", "kc_admin_loggers", "kc-p-loggers", false],
+  ];
+
+  function panelFilterInputHtml(panelBodyId) {
+    return `<div class="panel-toolbar"><label class="field"><span>Filter rows / JSON output</span><input class="text" id="${panelBodyId}-filter" type="text" placeholder="substring" maxlength="200" autocomplete="off" /></label></div>`;
+  }
+
+  function fillKcGrid(grid, rows) {
+    if (!grid) return;
+    const fullWidthOverviewBodies = new Set(["kc-p-status", "kc-p-info", "kc-p-full"]);
+    let html = "";
+    for (const [title, , bodyId] of rows) {
+      html += panelCard(title, bodyId, {
+        beforeBodyHtml: panelFilterInputHtml(bodyId),
+        spanAll: fullWidthOverviewBodies.has(bodyId),
+      });
+    }
+    grid.innerHTML = html;
+  }
+
+  fillKcGrid(app.querySelector("#kc-grid-overview"), overviewPanels);
+  fillKcGrid(app.querySelector("#kc-grid-connector"), connectorPanels);
+  fillKcGrid(app.querySelector("#kc-grid-infra"), infraPanels);
+
+  function decorateKafkaConnectStatus(rootEl) {
+    if (!rootEl) return;
+    for (const td of rootEl.querySelectorAll("td")) {
+      const raw = (td.textContent || "").trim().toUpperCase();
+      td.classList.remove("status-kc-good", "status-kc-warn", "status-kc-bad");
+      if (!raw) continue;
+      if (raw === "GREEN" || raw.includes("RUNNING")) td.classList.add("status-kc-good");
+      else if (raw === "YELLOW" || raw.includes("PAUSED") || raw.includes("UNASSIGNED") || raw.includes("RESTARTING"))
+        td.classList.add("status-kc-warn");
+      else if (raw === "RED" || raw.includes("FAILED") || raw.includes("ERROR") || raw.includes("DESTROYED"))
+        td.classList.add("status-kc-bad");
+    }
+  }
+
+  async function loadKcPanel(panelId, bodyId, needsConnector) {
+    const out = document.getElementById(bodyId);
+    if (!out) return;
+    const connector = document.getElementById("kc-connector-name")?.value?.trim() ?? "";
+    if (needsConnector && !connector) {
+      out.innerHTML = "<p class='muted'>Enter a <strong>connector name</strong> above, then click <strong>Refresh</strong>.</p>";
+      return;
+    }
+    const panelFilter = document.getElementById(`${bodyId}-filter`)?.value?.trim() ?? "";
+    const kcPod = document.getElementById("kc-pod-select")?.value ?? "0";
+    const u = new URL("/api/kafkaconnect/panel", location.origin);
+    u.searchParams.set("panel", panelId);
+    u.searchParams.set("kc_pod", kcPod);
+    if (connector) u.searchParams.set("connector", connector);
+    if (panelFilter) u.searchParams.set("panel_filter", panelFilter);
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) {
+        const blob = [j.error || "failed", j.stderr && `stderr:\n${j.stderr}`, j.stdout && `stdout:\n${j.stdout}`]
+          .filter(Boolean)
+          .join("\n\n");
+        out.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(blob)}`;
+        bindCopyButtons(out);
+        return;
+      }
+      let inner = "";
+      if (j.cmd_hint) inner += `<p class="panel-cmd-hint panel-cmd-hint--rich">${esc(j.cmd_hint)}</p>`;
+      if (j.path_executed) inner += `<p class="hint ch-sql-hint">${esc(`${String(j.http_method || "GET")} ${String(j.path_executed)}`)}</p>`;
+      if (j.table && j.table.length) {
+        const cols = Math.max(0, j.table[0].length || 0);
+        const strCols = Array.from({ length: cols }, (_, i) => i);
+        inner += kafkaTopicDataTableScroll(
+          renderTable(j.table, {
+            theadFirstRow: true,
+            tableClass: "es-cat-table",
+            sortableColumnIndexes: [],
+            stringSortableColumnIndexes: strCols,
+          }),
+        );
+      }
+      const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
+      inner += kafkaPreWithWrapFooter(blobOut);
+      inner += `<p class='hint'>HTTP via pod ${esc(String(j.pod || ""))}</p>`;
+      out.innerHTML = inner;
+      bindCopyButtons(out);
+      const wrap = out.querySelector(".kafka-topic-table-scroll");
+      if (wrap) wireKafkaTableHeaderSort(wrap);
+      decorateKafkaConnectStatus(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message || "failed")}</p>${kafkaPreWithWrapFooter(
+        JSON.stringify(e.detail || {}, null, 2),
+      )}`;
+      bindCopyButtons(out);
+    }
+  }
+
+  function wireKcPanels(grid, rows) {
+    if (!grid) return;
+    for (const [, panelId, bodyId, needsConnector] of rows) {
+      const btn = grid.querySelector(`[data-refresh="${bodyId}"]`);
+      btn?.addEventListener("click", () => {
+        void loadKcPanel(panelId, bodyId, needsConnector);
+      });
+      void loadKcPanel(panelId, bodyId, needsConnector);
+    }
+  }
+
+  wireKcPanels(app.querySelector("#kc-grid-overview"), overviewPanels);
+  wireKcPanels(app.querySelector("#kc-grid-connector"), connectorPanels);
+  wireKcPanels(app.querySelector("#kc-grid-infra"), infraPanels);
+
+  (async () => {
+    let stack = null;
+    try {
+      stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+    } catch {
+      stack = null;
+    }
+    if (!stack || !stack.components) {
+      try {
+        stack = await fetchJson("/api/k8s/stack");
+      } catch {
+        stack = null;
+      }
+    }
+    const rep = stack?.components?.kafkaconnect?.replicas;
+    const sel = document.getElementById("kc-pod-select");
+    if (!sel) return;
+    const n = typeof rep === "number" && rep > 0 ? rep : 1;
+    sel.innerHTML = "";
+    for (let i = 0; i < n; i++) {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = `glassbox-kafkaconnect-${i}`;
+      sel.appendChild(o);
+    }
+  })();
+
+  wireWorkloadLogs(app, "kafkaconnect");
+}
+
 function renderElasticsearch() {
   renderSearchEnginePage("elasticsearch");
 }
@@ -2180,6 +2450,7 @@ function renderPostgres() {
       <strong>Custom SQL</strong> is classified server-side; mutating statements require explicit confirmation.
       Password for <code>psql -U clarisite -d glassbox</code> comes from <code>data/sensitive/.pg_password</code> (gitignored), same pattern as ClickHouse.
       The default kubectl container name is <code>glassbox-postgresql</code>; for stock Bitnami charts use operator env <code>GB_STS_PG_CONTAINER=postgresql</code> when starting the tool server.
+      If exec fails with <code>psql: command not found</code>, set <code>GB_STS_PSQL</code> to the in-pod absolute path to <code>psql</code> (often <code>/opt/bitnami/postgresql/bin/psql</code>) and restart <code>server.py</code>.
     </p>
     <section class="panel">
       <h2>Pod</h2>
@@ -2190,18 +2461,25 @@ function renderPostgres() {
       </label>
     </section>
     <section class="panel">
+      <h2>Catalog (read-only)</h2>
+      <p class="muted">Fixed introspection queries; same <code>kubectl exec</code> path as tables and custom SQL.</p>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <button type="button" class="btn btn-primary" id="pg-catalog-databases">List databases</button>
+        <button type="button" class="btn btn-primary" id="pg-catalog-schemas">List schemas (current DB)</button>
+      </div>
+      <div id="pg-catalog-out"><p class="muted">Use the buttons above for <code>pg_database</code> / <code>information_schema.schemata</code>.</p></div>
+    </section>
+    <section class="panel">
       <h2>Tables (information_schema)</h2>
       <div class="panel-toolbar kafka-logs-toolbar">
+        <button type="button" class="btn" id="pg-schema-reload">Reload schema list</button>
         <label class="field field--inline">
           <span>Schema</span>
-          <select class="text" id="pg-schema">
-            <option value="clarisite_management">clarisite_management</option>
-            <option value="tenant_management">tenant_management</option>
-          </select>
+          <select class="text" id="pg-schema"><option value="">(load schemas first)</option></select>
         </label>
-        <button type="button" class="btn btn-primary" id="pg-tables-refresh">Refresh</button>
+        <button type="button" class="btn btn-primary" id="pg-tables-refresh">List tables</button>
       </div>
-      <div id="pg-tables-out"><p class="muted">Click Refresh after choosing schema.</p></div>
+      <div id="pg-tables-out"><p class="muted">Load schemas, pick one, then click <strong>List tables</strong>.</p></div>
     </section>
     <section class="panel exec-box">
       <h2>Custom SQL</h2>
@@ -2270,7 +2548,75 @@ function renderPostgres() {
       o.textContent = "glassbox-postgresql-0";
       sel.appendChild(o);
     }
+    await loadPgSchemasIntoSelect();
   })();
+
+  async function loadPgSchemasIntoSelect() {
+    const sel = document.getElementById("pg-schema");
+    const pg_pod = document.getElementById("pg-pod-select")?.value ?? "";
+    if (!sel) return;
+    const prev = sel.value;
+    const u = new URL("/api/postgres/panel", location.origin);
+    u.searchParams.set("panel", "schemas");
+    u.searchParams.set("pg_pod", pg_pod);
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) throw new Error(j.error || j.stderr || "failed");
+      const names = String(j.stdout || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      sel.innerHTML = "";
+      for (const n of names) {
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        sel.appendChild(o);
+      }
+      if (prev && names.includes(prev)) sel.value = prev;
+      else if (names.includes("glassbox")) sel.value = "glassbox";
+      else if (names.includes("public")) sel.value = "public";
+      else if (names.length) sel.selectedIndex = 0;
+    } catch {
+      sel.innerHTML =
+        "<option value='glassbox'>glassbox</option><option value='public'>public</option><option value='clarisite_management'>clarisite_management</option><option value='tenant_management'>tenant_management</option>";
+    }
+  }
+
+  async function loadPgCatalogPanel(which) {
+    const out = document.getElementById("pg-catalog-out");
+    const pg_pod = document.getElementById("pg-pod-select")?.value ?? "";
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    const u = new URL("/api/postgres/panel", location.origin);
+    u.searchParams.set("panel", which);
+    u.searchParams.set("pg_pod", pg_pod);
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+          { preClass: "output-pre--pg-tsv" },
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>${esc(which)} · pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob, {
+        preClass: "output-pre--pg-tsv",
+      })}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  }
+
+  document.getElementById("pg-pod-select")?.addEventListener("change", () => {
+    void loadPgSchemasIntoSelect();
+  });
+  document.getElementById("pg-schema-reload")?.addEventListener("click", () => void loadPgSchemasIntoSelect());
+  document.getElementById("pg-catalog-databases")?.addEventListener("click", () => void loadPgCatalogPanel("databases"));
+  document.getElementById("pg-catalog-schemas")?.addEventListener("click", () => void loadPgCatalogPanel("schemas"));
 
   renderPgHistoryUi();
   document.getElementById("pg-query-history")?.addEventListener("click", (ev) => {
@@ -2289,9 +2635,13 @@ function renderPostgres() {
 
   async function loadPgTables() {
     const out = document.getElementById("pg-tables-out");
-    const schema = document.getElementById("pg-schema")?.value ?? "clarisite_management";
+    const schema = document.getElementById("pg-schema")?.value?.trim() ?? "";
     const pg_pod = document.getElementById("pg-pod-select")?.value ?? "";
     if (!out) return;
+    if (!schema) {
+      out.innerHTML = "<p class='status-bad'>Choose a schema (use <strong>Reload schema list</strong> if the list is empty).</p>";
+      return;
+    }
     out.innerHTML = "<p class='muted'>Loading…</p>";
     const u = new URL("/api/postgres/panel", location.origin);
     u.searchParams.set("panel", "tables");
@@ -2302,12 +2652,15 @@ function renderPostgres() {
       if (!j.ok) {
         out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
           [j.stdout, j.stderr].filter(Boolean).join("\n"),
+          { preClass: "output-pre--pg-tsv" },
         )}`;
         bindCopyButtons(out);
         return;
       }
       const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
-      out.innerHTML = `<p class='hint'>pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      out.innerHTML = `<p class='hint'>pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob, {
+        preClass: "output-pre--pg-tsv",
+      })}`;
       bindCopyButtons(out);
     } catch (e) {
       const d = e.detail || {};
@@ -2328,8 +2681,24 @@ function renderPostgres() {
   function renderPgExecOut(j) {
     if (!pgExecInner) return;
     const asJson = pgExecJson && pgExecJson.checked;
-    const text = asJson ? JSON.stringify(j, null, 2) : formatExecPlainHelper(j);
-    pgExecInner.innerHTML = kafkaPreWithWrapFooter(text);
+    if (asJson) {
+      pgExecInner.innerHTML = kafkaPreWithWrapFooter(JSON.stringify(j, null, 2));
+      bindCopyButtons(pgExecInner);
+      return;
+    }
+    if (j && typeof j === "object" && j.ok && j.stdout != null && String(j.stdout).trim()) {
+      const out = String(j.stdout);
+      let foot = `<p class="hint muted">exit ${esc(String(j.returncode ?? ""))}`;
+      if (j.pod) foot += ` · pod ${esc(String(j.pod))}`;
+      foot += "</p>";
+      if (j.stderr != null && String(j.stderr).trim()) {
+        foot += `<p class="hint">${esc(String(j.stderr))}</p>`;
+      }
+      pgExecInner.innerHTML = `${kafkaPreWithWrapFooter(out, { preClass: "output-pre--pg-tsv" })}${foot}`;
+      bindCopyButtons(pgExecInner);
+      return;
+    }
+    pgExecInner.innerHTML = kafkaPreWithWrapFooter(formatExecPlainHelper(j));
     bindCopyButtons(pgExecInner);
   }
 
@@ -2394,6 +2763,7 @@ function renderCassandra() {
       <strong>Custom CQL</strong> is restricted and vetted server-side; writes require confirmation.
       The server looks for <code>cqlsh</code> under typical paths (e.g. Bitnami <code>/opt/bitnami/cassandra/bin/cqlsh</code>) before <code>PATH</code>.
       If your image stores it elsewhere, set operator env <code>GB_STS_CQLSH</code> to the <strong>in-pod</strong> absolute path before starting <code>server.py</code>.
+      CQL target uses <code>GB_STS_CASSANDRA_CQL_HOST</code> if set, else chart env <code>CASSANDRA_HOST</code> / <code>POD_IP</code> / <code>CASSANDRA_BROADCAST_ADDRESS</code>, else <code>127.0.0.1</code>. Port: <code>GB_STS_CASSANDRA_CQL_PORT</code> or <code>CASSANDRA_CQL_PORT_NUMBER</code> or <code>9042</code>.
     </p>
     <section class="panel">
       <h2>Pod</h2>
@@ -3079,17 +3449,19 @@ function route() {
   }
   setActiveNav();
   const h = location.hash || "#/";
-  if (h.startsWith("#/kafka")) {
+  if (hashMatchesRoute(h, "#/kafka-connect")) {
+    renderKafkaConnect();
+  } else if (hashMatchesRoute(h, "#/kafka")) {
     renderKafka();
-  } else if (h.startsWith("#/clickhouse")) {
-    renderClickhouse();
-  } else if (h.startsWith("#/elasticsearch")) {
+  } else if (hashMatchesRoute(h, "#/elasticsearch")) {
     renderElasticsearch();
-  } else if (h.startsWith("#/opensearch")) {
+  } else if (hashMatchesRoute(h, "#/opensearch")) {
     renderOpensearch();
-  } else if (h.startsWith("#/postgres")) {
+  } else if (hashMatchesRoute(h, "#/clickhouse")) {
+    renderClickhouse();
+  } else if (hashMatchesRoute(h, "#/postgres")) {
     renderPostgres();
-  } else if (h.startsWith("#/cassandra")) {
+  } else if (hashMatchesRoute(h, "#/cassandra")) {
     renderCassandra();
   } else {
     renderHome();

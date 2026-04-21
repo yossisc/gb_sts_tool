@@ -25,11 +25,12 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.17"
+VERSION = "1.0.27"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
 from backend import es_panels as esp  # noqa: E402
+from backend import kc_panels as kcp  # noqa: E402
 from backend import cloud_clusters as cc  # noqa: E402
 from backend import kafka_parse as kparse  # noqa: E402
 from backend import k8s_exec as kx  # noqa: E402
@@ -43,6 +44,7 @@ _httpd: ThreadingHTTPServer | None = None
 
 _LOG_DEFAULT_CONT: dict[str, str] = {
     "kafka": kx.KAFKA_CONTAINER,
+    "kafkaconnect": kx.KAFKA_CONNECT_CONTAINER,
     "clickhouse": kx.CLICKHOUSE_CONTAINER,
     "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
     "opensearch": kx.OPENSEARCH_CONTAINER,
@@ -190,6 +192,15 @@ def _es_pod_index_from_qs(qs: dict[str, list[str]]) -> int:
 
 def _os_pod_index_from_qs(qs: dict[str, list[str]]) -> int:
     raw = (qs.get("os_pod") or ["0"])[0].strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(n, 31))
+
+
+def _kc_pod_index_from_qs(qs: dict[str, list[str]]) -> int:
+    raw = (qs.get("kc_pod") or ["0"])[0].strip()
     try:
         n = int(raw)
     except ValueError:
@@ -366,7 +377,7 @@ def _workload_logs_stream(
         handler._json(
             {
                 "ok": False,
-                "error": "Missing or invalid workload (use kafka, clickhouse, elasticsearch, opensearch, postgresql, cassandra).",
+                "error": "Missing or invalid workload (use kafka, kafkaconnect, clickhouse, elasticsearch, opensearch, postgresql, cassandra).",
             },
             HTTPStatus.BAD_REQUEST,
         )
@@ -725,6 +736,55 @@ class Handler(SimpleHTTPRequestHandler):
             }
         )
 
+    def _kafka_connect_panel_get(self, qs: dict[str, list[str]]) -> None:
+        s = _session_from(self)
+        if not s:
+            self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+            return
+        panel = (qs.get("panel") or [""])[0].strip()
+        connector = (qs.get("connector") or [""])[0].strip()
+        panel_filter = (qs.get("panel_filter") or [""])[0].strip()[:200]
+        try:
+            method, path_qs = kcp.request_for_panel(panel, connector=connector)
+        except ValueError as e:
+            self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+        kc_pod = _kc_pod_index_from_qs(qs)
+        pod_name = f"{kx.KAFKA_CONNECT_POD_PREFIX}{kc_pod}"
+        ns = s["n"]
+        cl = _cloud_from_session(s)
+        ap = _aws_profile_from_session(s)
+        r = kx.kafka_connect_curl(
+            ns,
+            pod_name,
+            kx.KAFKA_CONNECT_CONTAINER,
+            path_qs,
+            method=method,
+            body=None,
+            timeout=160,
+            aws_profile=ap,
+            cloud=cl,
+        )
+        out_stdout = r.stdout or ""
+        table = kcp.table_for_panel(panel, out_stdout, panel_filter=panel_filter) if r.ok else None
+        out: dict = {
+            "ok": r.ok,
+            "panel": panel,
+            "stdout": kx.tail_lines(out_stdout, 15000),
+            "stderr": kx.filter_kubectl_noise(r.stderr),
+            "returncode": r.returncode,
+            "cmd_display": r.cmd_display,
+            "cmd_hint": kcp.KC_PANEL_CMD_HINT.get(panel, ""),
+            "http_method": method,
+            "path_executed": path_qs,
+            "pod": pod_name,
+            "connector": connector,
+            "panel_filter": panel_filter,
+        }
+        if table is not None:
+            out["table"] = table
+        self._json(out)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -734,8 +794,9 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({
                 "version": VERSION,
                 "name": "Glassbox STS Tool",
-                "description": "Read-first local dashboard: verify kubectl context, then inspect Kafka / ClickHouse / Elasticsearch in-cluster via kubectl exec.",
+                "description": "Read-first local dashboard: verify kubectl context, then inspect Kafka / Kafka Connect / ClickHouse / Elasticsearch / OpenSearch in-cluster via kubectl exec.",
                 "kafka_pod": kx.KAFKA_POD,
+                "kafkaconnect_pod_prefix": kx.KAFKA_CONNECT_POD_PREFIX,
                 "clickhouse_pod_prefix": kx.CLICKHOUSE_POD_PREFIX,
                 "elasticsearch_pod_prefix": kx.ELASTICSEARCH_POD_PREFIX,
                 "opensearch_pod_prefix": kx.OPENSEARCH_POD_PREFIX,
@@ -782,6 +843,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "postgres_password_configured": bool(sens.read_postgres_password()),
                 "workload_log_containers": {
                     "kafka": kx.KAFKA_CONTAINER,
+                    "kafkaconnect": kx.KAFKA_CONNECT_CONTAINER,
                     "clickhouse": kx.CLICKHOUSE_CONTAINER,
                     "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
                     "opensearch": kx.OPENSEARCH_CONTAINER,
@@ -828,6 +890,7 @@ class Handler(SimpleHTTPRequestHandler):
             to_ts = (qs.get("to_ts") or [""])[0].strip()
             event_table = (qs.get("event_table") or ["beacon_event"])[0].strip() or "beacon_event"
             tenant_id = (qs.get("tenant_id") or [""])[0].strip()
+            ch_database = (qs.get("database") or ["glassbox"])[0].strip() or "glassbox"
             try:
                 sql = chp.sql_for_panel(
                     panel,
@@ -836,11 +899,14 @@ class Handler(SimpleHTTPRequestHandler):
                     from_ts=from_ts,
                     to_ts=to_ts,
                     tenant_id=tenant_id,
+                    database=ch_database,
                 )
             except ValueError as e:
                 self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
                 return
             pod_name = f"{kx.CLICKHOUSE_POD_PREFIX}{ch_pod}"
+            explore = panel in ("ch_explore_databases", "ch_explore_tables")
+            out_fmt = "TabSeparatedWithNames" if explore else "PrettyCompact"
             r = kx.clickhouse_client_query(
                 ns,
                 pod_name,
@@ -850,20 +916,25 @@ class Handler(SimpleHTTPRequestHandler):
                 timeout=300,
                 aws_profile=ap,
                 cloud=cl,
+                output_format=out_fmt,
             )
-            self._json(
-                {
-                    "ok": r.ok,
-                    "panel": panel,
-                    "stdout": kx.tail_lines(r.stdout, 12000),
-                    "stderr": kx.filter_kubectl_noise(r.stderr),
-                    "returncode": r.returncode,
-                    "cmd_display": r.cmd_display,
-                    "cmd_hint": chp.CH_PANEL_CMD_HINT.get(panel, ""),
-                    "sql_executed": sql,
-                    "pod": pod_name,
-                }
-            )
+            table_rows: list[list[str]] = []
+            if explore and r.ok:
+                table_rows = kx.parse_clickhouse_tsv_with_header(r.stdout or "")
+            payload: dict = {
+                "ok": r.ok,
+                "panel": panel,
+                "stdout": kx.tail_lines(r.stdout, 12000),
+                "stderr": kx.filter_kubectl_noise(r.stderr),
+                "returncode": r.returncode,
+                "cmd_display": r.cmd_display,
+                "cmd_hint": chp.CH_PANEL_CMD_HINT.get(panel, ""),
+                "sql_executed": sql,
+                "pod": pod_name,
+            }
+            if explore:
+                payload["table"] = table_rows
+            self._json(payload)
             return
 
         if path == "/api/elasticsearch/panel":
@@ -872,6 +943,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/opensearch/panel":
             self._search_engine_panel_get(qs, engine="opensearch")
+            return
+
+        if path == "/api/kafkaconnect/panel":
+            self._kafka_connect_panel_get(qs)
             return
 
         if path == "/api/kafka/logs/stream":
@@ -907,9 +982,43 @@ class Handler(SimpleHTTPRequestHandler):
             ns = s["n"]
             cl = _cloud_from_session(s)
             ap = _aws_profile_from_session(s)
+            if panel == "databases":
+                sql = pgc.postgres_databases_sql()
+                r = kx.postgres_psql_query(
+                    ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=120, aws_profile=ap, cloud=cl
+                )
+                self._json(
+                    {
+                        "ok": r.ok,
+                        "panel": panel,
+                        "stdout": kx.tail_lines(r.stdout, 8000),
+                        "stderr": kx.filter_kubectl_noise(r.stderr),
+                        "returncode": r.returncode,
+                        "cmd_display": r.cmd_display,
+                        "pod": pod_name,
+                    }
+                )
+                return
+            if panel == "schemas":
+                sql = pgc.postgres_schemas_sql()
+                r = kx.postgres_psql_query(
+                    ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=120, aws_profile=ap, cloud=cl
+                )
+                self._json(
+                    {
+                        "ok": r.ok,
+                        "panel": panel,
+                        "stdout": kx.tail_lines(r.stdout, 8000),
+                        "stderr": kx.filter_kubectl_noise(r.stderr),
+                        "returncode": r.returncode,
+                        "cmd_display": r.cmd_display,
+                        "pod": pod_name,
+                    }
+                )
+                return
             if panel == "tables":
                 try:
-                    schema = pgc.sanitize_postgres_schema((qs.get("schema") or ["clarisite_management"])[0])
+                    schema = pgc.sanitize_postgres_schema((qs.get("schema") or ["public"])[0])
                 except ValueError as e:
                     self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
                     return

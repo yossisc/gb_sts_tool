@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.16",
+    "app_version": "1.0.27",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",
@@ -15,37 +15,42 @@
   },
   "rules_summary": [
     "Default read-only. No silent mutations.",
-    "Write/destructive kubectl or Kafka actions require explicit UI confirmation and server acknowledged confirmed flag.",
-    "kubectl exec uses -c kafka; each exec sets export JMX_PORT=<random high port> to avoid JMX bind collisions",
-    "sanitize_name pattern ^[A-Za-z0-9_.-]+$ for topic/group/namespace user input",
-    "AWS profile dropdown uses a fixed list in backend/aws_profiles.py (not ~/.aws/credentials); session key p → AWS_PROFILE on every kubectl",
-    "AWS (cloud=aws): subprocess_env merges ~/.aws/credentials keys for the selected profile into each kubectl/aws child process",
-    "ClickHouse password: operator file data/sensitive/.ch_password (gitignored)",
-    "PostgreSQL password: operator file data/sensitive/.pg_password (gitignored) for psql user clarisite",
-    "kubectl log streaming: GET /api/k8s/logs/stream?workload=&pod=&container= (session); leaving a page calls stopWorkloadLogStream()",
-    "Bump VERSION in server.py and mirrored cache-bust / footer on every release",
-    "kubectl context must remain visible in the header"
+    "Write/destructive kubectl or API actions require explicit UI confirmation and server acknowledged confirmed flag.",
+    "kubectl exec uses -c kafka for broker shell; each exec sets export JMX_PORT=<random high port> to avoid JMX bind collisions.",
+    "sanitize_name pattern ^[A-Za-z0-9_.-]+$ for topic/group/namespace and connector user input.",
+    "AWS profile dropdown uses a fixed list in backend/aws_profiles.py (not ~/.aws/credentials); session key p → AWS_PROFILE on every kubectl.",
+    "AWS (cloud=aws): subprocess_env merges ~/.aws/credentials keys for the selected profile into each kubectl/aws child process.",
+    "Home page keeps last listed clusters + selected entry in sessionStorage and restores when cloud/region/profile match.",
+    "Top nav workload pages are hidden until session verify; once visible they are disabled (gray, non-clickable) when stack replicas are 0.",
+    "Elasticsearch/OpenSearch pages: allocation JSON body is inside Allocation explain panel; Cat shards supports sorting by index+shard and has local index-pattern field synced with indices toolbar.",
+    "All panel/log outputs support wrap toggle checkbox.",
+    "kubectl log streaming: GET /api/k8s/logs/stream?workload=&pod=&container= (session); leaving a page calls stopWorkloadLogStream().",
+    "Bump VERSION in server.py and mirrored cache-bust / footer on every release.",
+    "kubectl context must remain visible in the header."
   ],
   "http_api": {
     "routes": [
       { "method": "GET", "path": "/api/aws/profiles", "response": "{ ok, profiles[], default_profile, meta{ source: builtin } } — fixed list, does not read ~/.aws" },
-      { "method": "GET", "path": "/api/about", "notes": "version, name, kafka_pod" },
+      { "method": "GET", "path": "/api/about", "notes": "version, name, kafka_pod and pod prefixes for kafka-connect/clickhouse/es/os" },
       { "method": "GET", "path": "/api/k8s/defaults", "notes": "Home defaults from data/sensitive/last_connected.json + regions + clouds" },
       { "method": "GET", "path": "/api/k8s/context", "notes": "current_context, cluster_server, cloud, aws_profile" },
-      { "method": "GET", "path": "/api/session/status", "notes": "verified + session payload" },
+      { "method": "GET", "path": "/api/session/status", "notes": "verified + session payload + workload_log_containers map" },
       { "method": "POST", "path": "/api/clusters/list", "body": "{ cloud, region, aws_profile? }" },
       { "method": "POST", "path": "/api/k8s/verify", "body": "{ connect?, cluster_name?, namespace?, aws_profile?, cloud?, region? }", "effect": "Optional aws eks update-kubeconfig / az aks get-credentials; then cluster-info; writes data/sensitive/last_connected.json" },
       { "method": "POST", "path": "/api/session/clear", "effect": "Clear session cookie" },
-      { "method": "GET", "path": "/api/kafka/panel", "query": "panel=&group=&topic=&topics_min=&topics_substring=", "auth": "session cookie required", "notes": "topics_min / topics_substring apply to panel topics_partition_counts only" },
       { "method": "GET", "path": "/api/k8s/stack", "auth": "session", "notes": "Pod replica counts per known Glassbox component in session namespace" },
-      { "method": "GET", "path": "/api/clickhouse/panel", "query": "panel=&ch_pod=&hours=&from_ts=&to_ts=&event_table=&tenant_id=", "auth": "session", "notes": "Password from data/sensitive/.ch_password" },
+      { "method": "GET", "path": "/api/kafka/panel", "query": "panel=&group=&topic=&topics_min=&topics_substring=", "auth": "session cookie required", "notes": "topics_min / topics_substring apply to panel topics_partition_counts only" },
       { "method": "POST", "path": "/api/kafka/rebalance/analyze", "body": "{}", "auth": "session", "notes": "kubectl exec kafka pod: du -sk /bitnami/kafka/data/*; response table is per-topic total MB (sorted desc) + default_num_brokers (read-only)" },
       { "method": "POST", "path": "/api/kafka/exec", "body": "{ command, confirmed? }", "auth": "session cookie required", "notes": "409 + needs_confirmation when risky and confirmed false" },
+      { "method": "GET", "path": "/api/kafkaconnect/panel", "query": "panel=&kc_pod=&connector=&panel_filter=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:8083 in kafka-connect pod" },
+      { "method": "GET", "path": "/api/clickhouse/panel", "query": "panel=&ch_pod=&hours=&from_ts=&to_ts=&event_table=&tenant_id=&database=", "auth": "session", "notes": "Password from data/sensitive/.ch_password; explorer panels return table JSON; default DB via GB_STS_CLICKHOUSE_DATABASE (glassbox)" },
       { "method": "POST", "path": "/api/clickhouse/exec", "body": "{ sql, ch_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
       { "method": "GET", "path": "/api/elasticsearch/panel", "query": "panel=&es_pod=&idx_health=&idx_state=&idx_substring=&alloc_body=&index_pattern=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:9200 in ES pod" },
       { "method": "POST", "path": "/api/elasticsearch/exec", "body": "{ path, method: GET, es_pod, confirmed? }", "auth": "session", "notes": "Custom GET path only; 409 if path not on allowlist" },
-      { "method": "GET", "path": "/api/k8s/logs/stream", "query": "workload=kafka|clickhouse|elasticsearch|postgresql|cassandra&pod=&container=", "auth": "session", "notes": "SSE text/event-stream; workload-specific pod/container allowlist" },
-      { "method": "GET", "path": "/api/postgres/panel", "query": "panel=tables&schema=clarisite_management|tenant_management&pg_pod=", "auth": "session", "notes": "Fixed SELECT via psql; requires .pg_password" },
+      { "method": "GET", "path": "/api/opensearch/panel", "query": "panel=&os_pod=&idx_health=&idx_state=&idx_substring=&alloc_body=&index_pattern=", "auth": "session", "notes": "kubectl exec + curl to 127.0.0.1:9200 in OS pod" },
+      { "method": "POST", "path": "/api/opensearch/exec", "body": "{ path, method: GET, os_pod, confirmed? }", "auth": "session", "notes": "Custom GET path only; 409 if path not on allowlist" },
+      { "method": "GET", "path": "/api/k8s/logs/stream", "query": "workload=kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|cassandra&pod=&container=", "auth": "session", "notes": "SSE text/event-stream; workload-specific pod/container allowlist" },
+      { "method": "GET", "path": "/api/postgres/panel", "query": "panel=databases|schemas|tables&schema=&pg_pod=", "auth": "session", "notes": "Fixed SELECT via psql; requires .pg_password; psql path via GB_STS_PSQL if not on PATH" },
       { "method": "POST", "path": "/api/postgres/exec", "body": "{ sql, pg_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
       { "method": "GET", "path": "/api/cassandra/panel", "query": "panel=keyspaces|desc_keyspace|tables&cass_pod=&keyspace=", "auth": "session", "notes": "Fixed read-only CQL via cqlsh" },
       { "method": "POST", "path": "/api/cassandra/exec", "body": "{ cql, cass_pod, confirmed? }", "auth": "session", "notes": "409 when CQL not read-only and confirmed false" }
@@ -57,15 +62,29 @@
     "bootstrap_inside_pod": "127.0.0.1:9092",
     "bin_prefix": "/opt/bitnami/kafka/bin"
   },
+  "kafka_connect": {
+    "pod_prefix": "glassbox-kafkaconnect-",
+    "kubectl_container_env": "GB_STS_KAFKA_CONNECT_CONTAINER",
+    "kubectl_container_default": "kafka",
+    "http_inside_pod": "http://127.0.0.1:8083"
+  },
   "clickhouse": {
     "pod_prefix": "glassbox-clickhouse-",
     "kubectl_container": "glassbox-clickhouse",
-    "password_file": "data/sensitive/.ch_password"
+    "password_file": "data/sensitive/.ch_password",
+    "default_database_env": "GB_STS_CLICKHOUSE_DATABASE",
+    "default_database_default": "glassbox"
   },
   "elasticsearch": {
     "pod_prefix": "glassbox-elasticsearch-master-",
     "kubectl_container_env": "GB_STS_ES_CONTAINER",
     "kubectl_container_default": "elasticsearch",
+    "http_inside_pod": "http://127.0.0.1:9200"
+  },
+  "opensearch": {
+    "pod_prefix": "glassbox-opensearch-master-",
+    "kubectl_container_env": "GB_STS_OS_CONTAINER",
+    "kubectl_container_default": "opensearch",
     "http_inside_pod": "http://127.0.0.1:9200"
   },
   "postgresql": {
@@ -74,13 +93,18 @@
     "kubectl_container_default": "glassbox-postgresql",
     "password_file": "data/sensitive/.pg_password",
     "psql_user": "clarisite",
-    "psql_db": "glassbox"
+    "psql_db": "glassbox",
+    "psql_operator_env": "GB_STS_PSQL",
+    "psql_notes": "Server resolves psql: GB_STS_PSQL if set, else Bitnami/common paths, else PATH"
   },
   "cassandra": {
     "pod_prefix": "glassbox-cassandra-",
     "kubectl_container_env": "GB_STS_CASS_CONTAINER",
     "kubectl_container_default": "cassandra",
     "cqlsh_operator_env": "GB_STS_CQLSH",
-    "cqlsh_notes": "Server resolves cqlsh: GB_STS_CQLSH if set, else /opt/bitnami/cassandra/bin/cqlsh and common paths, else PATH"
+    "cqlsh_notes": "Server resolves cqlsh: GB_STS_CQLSH if set, else /opt/bitnami/cassandra/bin/cqlsh and common paths, else PATH",
+    "cqlsh_host_env": "GB_STS_CASSANDRA_CQL_HOST",
+    "cqlsh_port_env": "GB_STS_CASSANDRA_CQL_PORT",
+    "cqlsh_host_notes": "cqlsh host: GB_STS_CASSANDRA_CQL_HOST else CASSANDRA_HOST / POD_IP / CASSANDRA_BROADCAST_ADDRESS / 127.0.0.1; port from GB_STS_CASSANDRA_CQL_PORT or CASSANDRA_CQL_PORT_NUMBER or 9042"
   }
 }

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import re
 
-_PG_SCHEMA_ALLOW = frozenset({"clarisite_management", "tenant_management"})
+_PG_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 
 
 def sanitize_postgres_schema(schema: str) -> str:
+    """Allow typical PostgreSQL identifier-style schema names (read-only catalog queries only)."""
     s = (schema or "").strip()
-    if s not in _PG_SCHEMA_ALLOW:
-        raise ValueError("schema must be clarisite_management or tenant_management")
+    if not _PG_IDENT.match(s):
+        raise ValueError("invalid schema name (letters, digits, underscore; max 63 chars)")
     return s
 
 
@@ -61,6 +62,19 @@ def postgres_tables_sql(schema: str) -> str:
         "SELECT table_name FROM information_schema.tables "
         f"WHERE table_schema = '{s}' AND table_type = 'BASE TABLE' "
         "ORDER BY table_name LIMIT 500"
+    )
+
+
+def postgres_databases_sql() -> str:
+    """List non-template databases (read-only)."""
+    return "SELECT datname FROM pg_database WHERE datistemplate IS FALSE ORDER BY datname"
+
+
+def postgres_schemas_sql() -> str:
+    """List schemas in the current database (read-only)."""
+    return (
+        "SELECT schema_name FROM information_schema.schemata "
+        "WHERE catalog_name = current_database() ORDER BY schema_name"
     )
 
 

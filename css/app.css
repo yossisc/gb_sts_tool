@@ -283,6 +283,20 @@ select.text {
   word-break: normal;
 }
 
+/* ClickHouse PrettyCompact: monospace + no ANSI (stripped in JS) keeps box corners aligned. */
+.output-pre.output-pre--ch-pretty {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+/* PostgreSQL unaligned output with tab field separator (psql -A -F tab). */
+.output-pre.output-pre--pg-tsv {
+  tab-size: 8;
+  white-space: pre;
+  overflow-x: auto;
+  word-break: normal;
+  font-variant-numeric: tabular-nums;
+}
+
 .pre-copy-wrap {
   position: relative;
   margin-top: 0.5rem;
@@ -825,6 +839,21 @@ button.cell-link:hover {
 
 .status-bad {
   color: var(--off);
+}
+
+.status-kc-good {
+  color: var(--on);
+  font-weight: 600;
+}
+
+.status-kc-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.status-kc-bad {
+  color: var(--off);
+  font-weight: 600;
 }
 
 .verify-status {

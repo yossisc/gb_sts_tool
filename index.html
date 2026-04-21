@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Glassbox STS Tool</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="css/app.css?v=1.0.23" />
+  <link rel="stylesheet" href="css/app.css?v=1.0.27" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand-block">
       <h1>Glassbox STS Tool</h1>
-      <p class="tagline">Read-first Kafka, ClickHouse, Elasticsearch, PostgreSQL &amp; Cassandra diagnostics via kubectl</p>
+      <p class="tagline">Read-first Kafka, Kafka Connect, Elasticsearch, OpenSearch, ClickHouse, PostgreSQL &amp; Cassandra diagnostics via kubectl</p>
     </div>
     <div class="k8s-strip" id="k8s-strip" title="Current kubectl context (refreshed periodically)">
       <span class="k8s-strip-label">kubectl context</span>
@@ -21,9 +21,10 @@
     <nav class="nav" id="nav">
       <a href="#/" data-route>Home</a>
       <a href="#/kafka" data-route id="nav-kafka" class="nav-gated" hidden>Kafka</a>
-      <a href="#/clickhouse" data-route id="nav-clickhouse" class="nav-gated" hidden>ClickHouse</a>
+      <a href="#/kafka-connect" data-route id="nav-kafka-connect" class="nav-gated" hidden>Kafka Connect</a>
       <a href="#/elasticsearch" data-route id="nav-elasticsearch" class="nav-gated" hidden>Elasticsearch</a>
       <a href="#/opensearch" data-route id="nav-opensearch" class="nav-gated" hidden>OpenSearch</a>
+      <a href="#/clickhouse" data-route id="nav-clickhouse" class="nav-gated" hidden>ClickHouse</a>
       <a href="#/postgres" data-route id="nav-postgres" class="nav-gated" hidden>PostgreSQL</a>
       <a href="#/cassandra" data-route id="nav-cassandra" class="nav-gated" hidden>Cassandra</a>
     </nav>
@@ -32,11 +33,11 @@
   <main id="app" class="main"></main>
 
   <footer class="footer">
-    <span id="footer-status">v1.0.23</span>
+    <span id="footer-status">v1.0.27</span>
     <span class="footer-sep">·</span>
     <span id="footer-session" class="muted"></span>
   </footer>
 
-  <script type="module" src="js/app.js?v=1.0.23"></script>
+  <script type="module" src="js/app.js?v=1.0.27"></script>
 </body>
 </html>

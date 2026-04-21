@@ -9,6 +9,13 @@ from typing import Final
 _SAFE_EVENT = re.compile(r"^(beacon_event|mobile_event)$")
 _TENANT_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _TS_FREE = re.compile(r"^[0-9 T:\+\-\.Z]{8,48}$")
+_CH_DB = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+
+
+def _ch_string_literal(val: str) -> str:
+    """Single-quoted SQL string literal for ClickHouse (``shlex.quote`` is for shells, not SQL)."""
+    return "'" + (val or "").replace("\\", "\\\\").replace("'", "\\'") + "'"
+
 
 CH_PANEL_CMD_HINT: dict[str, str] = {
     "ch_max_session_ts": "clickhouse-client --password … -q 'SELECT toDateTime(max(session_ts)) …'",
@@ -18,6 +25,8 @@ CH_PANEL_CMD_HINT: dict[str, str] = {
     "ch_beacon_tenant_hour": "clickhouse-client … -q '… beacon_event … tenant_id = …'",
     "ch_mobile_by_hour": "clickhouse-client … -q '… mobile_event …'",
     "ch_beacon_by_hour": "clickhouse-client … -q '… beacon_event …'",
+    "ch_explore_databases": "clickhouse-client … -q 'SELECT name, engine FROM system.databases …'",
+    "ch_explore_tables": "clickhouse-client … -q 'SELECT … FROM system.tables WHERE database = …'",
 }
 
 CH_PANEL_IDS: Final[frozenset[str]] = frozenset(CH_PANEL_CMD_HINT.keys())
@@ -57,6 +66,13 @@ def sanitize_tenant_id(raw: str) -> str:
     return v
 
 
+def sanitize_clickhouse_db_name(raw: str) -> str:
+    d = (raw or "").strip() or "glassbox"
+    if not _CH_DB.match(d):
+        raise ValueError("invalid database name")
+    return d
+
+
 def sql_for_panel(
     panel: str,
     *,
@@ -65,9 +81,23 @@ def sql_for_panel(
     from_ts: str = "",
     to_ts: str = "",
     tenant_id: str = "",
+    database: str = "",
 ) -> str:
     if panel not in CH_PANEL_IDS:
         raise ValueError("unknown ClickHouse panel")
+
+    if panel == "ch_explore_databases":
+        return "SELECT name AS database, engine FROM system.databases ORDER BY name"
+
+    if panel == "ch_explore_tables":
+        db = sanitize_clickhouse_db_name(database or "glassbox")
+        dq = _ch_string_literal(db)
+        return (
+            "SELECT database, name AS table, engine, total_rows, "
+            "formatReadableSize(total_bytes) AS readable_size "
+            f"FROM system.tables WHERE database = {dq} ORDER BY name LIMIT 5000"
+        )
+
     table = qualified_table(event_table)
     tw = time_predicate(hours, from_ts, to_ts)
 

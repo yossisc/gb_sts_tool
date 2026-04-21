@@ -37,6 +37,12 @@ STACK_COMPONENTS: list[ComponentSpec] = [
         "notes": "Master pods; multi-node cluster.",
     },
     {
+        "id": "kafkaconnect",
+        "label": "Kafka Connect",
+        "pod_prefixes": ["glassbox-kafkaconnect-"],
+        "notes": "StatefulSet prefix; REST API on localhost:8083 inside pod.",
+    },
+    {
         "id": "clingine",
         "label": "Clingine",
         "pod_prefixes": ["clingine-"],

@@ -25,6 +25,16 @@ _WORKLOAD_DISK_PATH: dict[str, str | None] = {
     "cassandra": "/bitnami/cassandra",
 }
 
+_WORKLOAD_CONTAINER: dict[str, str | None] = {
+    "kafka": kx.KAFKA_CONTAINER,
+    "kafkaconnect": None,
+    "elasticsearch": kx.ELASTICSEARCH_CONTAINER,
+    "opensearch": kx.OPENSEARCH_CONTAINER,
+    "clickhouse": kx.CLICKHOUSE_CONTAINER,
+    "postgresql": kx.POSTGRES_CONTAINER,
+    "cassandra": kx.CASSANDRA_CONTAINER,
+}
+
 
 def _prefixes_for_workload(workload: str) -> list[str]:
     w = (workload or "").strip().lower()
@@ -36,6 +46,15 @@ def _prefixes_for_workload(workload: str) -> list[str]:
 
 def _pod_matches_prefixes(name: str, prefixes: list[str]) -> bool:
     return any(name.startswith(p) for p in prefixes)
+
+
+# Kafka pod status: only broker StatefulSet pods (glassbox-kafka-<n>), not Deployments
+# such as glassbox-kafka-exporter-* that share the same name prefix.
+_KAFKA_STS_BROKER_POD = re.compile(r"^glassbox-kafka-\d+$")
+
+
+def _kafka_broker_status_pod(name: str) -> bool:
+    return bool(_KAFKA_STS_BROKER_POD.match(name))
 
 
 def _parse_rfc3339(ts: str | None) -> datetime | None:
@@ -245,6 +264,8 @@ def fetch_workload_pod_status(
         name = str(meta.get("name") or "")
         if not name or not _pod_matches_prefixes(name, prefixes):
             continue
+        if w == "kafka" and not _kafka_broker_status_pod(name):
+            continue
         matched.append(item)
     matched.sort(key=lambda it: str((it.get("metadata") or {}).get("name") or ""))
 
@@ -293,22 +314,27 @@ def fetch_workload_pod_status(
 
     disk_by_pod: dict[str, dict[str, str]] = {n: {"size": "N/A", "used": "N/A", "free": "N/A"} for n in pod_names}
     disk_path = _WORKLOAD_DISK_PATH.get(w)
+    disk_container = _WORKLOAD_CONTAINER.get(w)
     if disk_path and pod_names:
         pods_list = sorted(pod_names)
         pod_tokens = " ".join(shlex.quote(p) for p in pods_list)
         nsq = shlex.quote(namespace)
         pathq = shlex.quote(disk_path)
+        cq = shlex.quote(disk_container) if disk_container else ""
+        c_arg = f"-c {cq} " if cq else ""
         script = (
             "for p in "
             + pod_tokens
             + "; do "
             + 'printf "__GB_POD__ %s\\n" "$p"; '
-            + f'kubectl exec -n {nsq} "$p" -- sh -lc "df -h {pathq} 2>/dev/null | awk \'NR==2{{print \\$2\"|\"\\$3\"|\"\\$4}}\'" 2>/dev/null || true; '
+            + f'kubectl exec -n {nsq} {c_arg}"$p" -- df -h {pathq} 2>/dev/null | awk \'NR==2{{print $2\"|\"$3\"|\"$4}}\' || true; '
             + "done"
         )
         r_df = kx._run(["bash", "-lc", script], timeout=80, aws_profile=aws_profile, cloud=cloud)
         if r_df.ok:
             disk_by_pod = _parse_df_batch(r_df.stdout or "", pod_names)
+            if pod_names and not any(v.get("size") != "N/A" for v in disk_by_pod.values()):
+                errors["storage"] = "df probe returned no rows (mount path missing or container mismatch)"
         else:
             errors["storage"] = kx.filter_kubectl_noise(r_df.stderr) or "kubectl exec df scan failed"
 

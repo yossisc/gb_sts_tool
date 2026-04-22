@@ -27,7 +27,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.31";
+const VERSION = "1.0.38";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -686,28 +686,58 @@ async function fetchStackJsonIfVerified() {
 }
 
 /**
- * Gray out nav links when probe reports 0 replicas for that component (stack known).
- * @param {Record<string, unknown> | null} st
+ * Cached stack probe so nav rendering is synchronous on every hashchange.
+ * @type {Record<string, unknown> | null}
  */
-function applyWorkloadNavAvailability(st) {
+let stackProbeCache = null;
+
+/**
+ * Pull replica count for a stack component out of the cached probe.
+ * @param {string} compKey
+ * @returns {number | null} ``null`` when stack info is not yet known.
+ */
+function workloadReplicaCount(compKey) {
+  const st = stackProbeCache;
+  if (!st || st.ok !== true || !st.components || typeof st.components !== "object") return null;
+  const entry = /** @type {Record<string, unknown>} */ (st.components)[compKey];
+  if (!entry || typeof entry !== "object") return 0;
+  const rep = /** @type {{ replicas?: unknown }} */ (entry).replicas;
+  return typeof rep === "number" && Number.isFinite(rep) ? rep : 0;
+}
+
+/**
+ * Compute nav state for one workload based on session + stack cache.
+ * @param {string} compKey
+ * @returns {"hidden" | "enabled" | "disabled"}
+ */
+function workloadNavState(compKey) {
+  if (!sessionVerified) return "hidden";
+  const rep = workloadReplicaCount(compKey);
+  if (rep === null) return "enabled";
+  return rep > 0 ? "enabled" : "disabled";
+}
+
+/**
+ * Single source of truth for the top nav. Idempotent — safe to call on every
+ * hashchange and after every session/stack refresh. Never produces a flicker
+ * because it always paints from the latest cached state in one pass.
+ */
+function applyNavState() {
   for (const [el, compKey] of WORKLOAD_NAV_STACK_KEYS) {
     if (!el) continue;
-    const known = !!(st && st.ok === true && st.components && typeof st.components === "object");
-    let rep = 0;
-    if (known) {
-      const entry = /** @type {Record<string, unknown>} */ (st.components)[compKey];
-      rep =
-        entry && typeof entry === "object" && typeof entry.replicas === "number" && Number.isFinite(entry.replicas)
-          ? entry.replicas
-          : 0;
-    }
-    const disabled = known && rep <= 0;
-    if (disabled) {
+    const state = workloadNavState(compKey);
+    if (state === "hidden") {
       el.hidden = true;
+      el.classList.remove("nav-disabled");
+      el.removeAttribute("aria-disabled");
+      el.removeAttribute("tabindex");
+      el.removeAttribute("title");
+    } else if (state === "disabled") {
+      el.hidden = false;
       el.classList.add("nav-disabled");
       el.setAttribute("aria-disabled", "true");
       el.setAttribute("tabindex", "-1");
-      el.title = "No pods for this workload in the connected namespace.";
+      el.title = "Not deployed in the connected namespace (0 replicas).";
     } else {
       el.hidden = false;
       el.classList.remove("nav-disabled");
@@ -718,59 +748,61 @@ function applyWorkloadNavAvailability(st) {
   }
 }
 
-function clearWorkloadNavDisabledState() {
-  for (const [el] of WORKLOAD_NAV_STACK_KEYS) {
-    if (!el) continue;
-    el.hidden = false;
-    el.classList.remove("nav-disabled");
-    el.removeAttribute("aria-disabled");
-    el.removeAttribute("tabindex");
-    el.removeAttribute("title");
-  }
-}
-
 function hashMatchesRoute(hash, href) {
   if (hash === href) return true;
   if (!href || href === "#/") return false;
   return hash.startsWith(`${href}/`) || hash.startsWith(`${href}?`);
 }
 
-function isCurrentHashWorkloadDisabled() {
+/** Stack component id for the current hash, or null when on Home/unknown. */
+function currentRouteCompKey() {
   const h = location.hash || "#/";
-  const pairs = [
-    ["#/kafka-connect", navKafkaConnect],
-    ["#/kafka", navKafka],
-    ["#/elasticsearch", navElasticsearch],
-    ["#/opensearch", navOpensearch],
-    ["#/clickhouse", navClickhouse],
-    ["#/postgres", navPostgres],
-    ["#/cassandra", navCassandra],
-  ];
-  for (const [prefix, el] of pairs) {
-    if (hashMatchesRoute(h, prefix)) {
-      return !!(el && el.classList.contains("nav-disabled"));
-    }
+  for (const [prefix, comp] of WORKLOAD_ROUTE_TO_COMP) {
+    if (hashMatchesRoute(h, prefix)) return comp;
   }
-  return false;
+  return null;
 }
 
 /**
- * Uses cached stack probe to decide if hash route is currently available.
- * Returns true when stack cache is unknown to avoid accidental false blocking.
- * @param {string} hash
+ * Friendly label per stack component id (used for in-page callouts).
+ * @param {string} compKey
+ */
+function workloadDisplayName(compKey) {
+  return (
+    {
+      kafka: "Kafka",
+      kafkaconnect: "Kafka Connect",
+      clickhouse: "ClickHouse",
+      elasticsearch: "Elasticsearch",
+      opensearch: "OpenSearch",
+      postgresql: "PostgreSQL",
+      cassandra: "Cassandra",
+    }[compKey] || compKey
+  );
+}
+
+/**
+ * Render the in-page gating callout into ``app`` for the current workload route
+ * when navigation is blocked (no session, or 0 replicas). Returns ``true`` when
+ * a callout was shown — caller should ``return`` immediately.
  * @returns {boolean}
  */
-function isWorkloadRouteAvailable(hash) {
-  const st = stackFromSessionStorage();
-  const known = !!(st && st.ok === true && st.components && typeof st.components === "object");
-  if (!known) return true;
-  for (const [prefix, comp] of WORKLOAD_ROUTE_TO_COMP) {
-    if (!hashMatchesRoute(hash, prefix)) continue;
-    const e = /** @type {Record<string, unknown>} */ (st.components)[comp];
-    const rep = e && typeof e === "object" && typeof e.replicas === "number" && Number.isFinite(e.replicas) ? e.replicas : 0;
-    return rep > 0;
+function renderWorkloadGateCalloutIfBlocked() {
+  const comp = currentRouteCompKey();
+  if (!comp) return false;
+  if (!sessionVerified) {
+    app.innerHTML = `<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The ${esc(
+      workloadDisplayName(comp),
+    )} page is hidden until verification succeeds.</div>`;
+    return true;
   }
-  return true;
+  if (workloadReplicaCount(comp) === 0) {
+    app.innerHTML = `<div class='callout callout-warn'><strong>${esc(
+      workloadDisplayName(comp),
+    )}</strong> is not deployed in the connected namespace (0 replicas reported by the stack probe). Pick a different workload from the menu, or go back to <a href='#/'>Home</a> and connect to another cluster.</div>`;
+    return true;
+  }
+  return false;
 }
 
 async function refreshK8sStrip() {
@@ -817,48 +849,30 @@ async function refreshSessionUi() {
         if (prev !== fp) {
           sessionStorage.removeItem("gb_sts_stack");
           sessionStorage.setItem("gb_sts_session_fp", fp);
+          stackProbeCache = null;
         }
       } catch {
         /* ignore */
       }
-      navKafka.hidden = false;
-      if (navKafkaConnect) navKafkaConnect.hidden = false;
-      if (navClickhouse) navClickhouse.hidden = false;
-      if (navElasticsearch) navElasticsearch.hidden = false;
-      if (navOpensearch) navOpensearch.hidden = false;
-      if (navPostgres) navPostgres.hidden = false;
-      if (navCassandra) navCassandra.hidden = false;
       const ap = s.session.p ? ` · AWS ${s.session.p}` : "";
       const reg = s.session.r ? ` · ${s.session.r}` : "";
       const cl = s.session.d ? ` · ${String(s.session.d).toUpperCase()}` : "";
       footerSession.textContent = `Session: namespace ${s.session.n} · match “${s.session.c}”${cl}${reg}${ap}`;
-      const st = await fetchStackJsonIfVerified();
-      applyWorkloadNavAvailability(st);
-      if (isCurrentHashWorkloadDisabled()) {
-        location.hash = "#/";
-      }
+      stackProbeCache = stackFromSessionStorage();
+      applyNavState();
+      const fresh = await fetchStackJsonIfVerified();
+      if (fresh) stackProbeCache = fresh;
+      applyNavState();
     } else {
-      navKafka.hidden = true;
-      if (navKafkaConnect) navKafkaConnect.hidden = true;
-      if (navClickhouse) navClickhouse.hidden = true;
-      if (navElasticsearch) navElasticsearch.hidden = true;
-      if (navOpensearch) navOpensearch.hidden = true;
-      if (navPostgres) navPostgres.hidden = true;
-      if (navCassandra) navCassandra.hidden = true;
-      clearWorkloadNavDisabledState();
-      footerSession.textContent = "Session: not connected";
+      stackProbeCache = null;
+      footerSession.textContent = "Session: not connected · only Home is available until you verify a cluster";
+      applyNavState();
     }
   } catch {
     sessionVerified = false;
-    navKafka.hidden = true;
-    if (navKafkaConnect) navKafkaConnect.hidden = true;
-    if (navClickhouse) navClickhouse.hidden = true;
-    if (navElasticsearch) navElasticsearch.hidden = true;
-    if (navOpensearch) navOpensearch.hidden = true;
-    if (navPostgres) navPostgres.hidden = true;
-    if (navCassandra) navCassandra.hidden = true;
-    clearWorkloadNavDisabledState();
-    footerSession.textContent = "Session: unknown";
+    stackProbeCache = null;
+    footerSession.textContent = "Session: unknown · only Home is available until you verify a cluster";
+    applyNavState();
   }
 }
 
@@ -874,7 +888,49 @@ function setActiveNav() {
   });
 }
 
+/** Block keyboard / programmatic activation of disabled nav links. */
+document.addEventListener("click", (ev) => {
+  const a = ev.target instanceof Element ? ev.target.closest(".nav a[data-route]") : null;
+  if (a && a.classList.contains("nav-disabled")) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+});
+
 /** @param {{ index: number, variant: "topic" | "group" | "es_index" | "cassandra_keyspace" }} pick */
+/** Headers that represent numeric metrics (size, counts, lag) even when the column was only marked string-sortable. */
+function isNumericSortHeaderLabel(label) {
+  const raw = String(label ?? "").trim();
+  const s = raw.toLowerCase();
+  if (!s) return false;
+  if (/\bresize\b/.test(s)) return false;
+  if (/(^|[^a-z])size([^a-z]|$)/i.test(raw)) return true;
+  if (/\b(store|disk|bytes)\b/i.test(raw)) return true;
+  if (/\bdocs?\b/.test(s) && (/\bcount\b/.test(s) || s.includes(".count"))) return true;
+  if (/\blag\b/.test(s)) return true;
+  if (/^rows?$/i.test(raw)) return true;
+  if (/\b(memory|usage)\b/i.test(s) && !/\b(engine|policy)\b/.test(s)) return true;
+  if (/\b(used|free|available|capacity|total)\b/i.test(s) && /\b(bytes|disk|space|storage|size)\b/i.test(s)) return true;
+  return false;
+}
+
+/** Parse a table cell for numeric sort (human sizes with optional KB/MB/GB suffix). */
+function parseCellSortNumber(cellText) {
+  const t = String(cellText ?? "")
+    .trim()
+    .replace(/,/g, "");
+  if (!t || /^n\/?a$/i.test(t) || t === "—" || t === "-") return NaN;
+  const m = t.match(/^([\d.eE+-]+)\s*([kmgt]?)i?b?$/i);
+  if (m && m[2]) {
+    const base = Number.parseFloat(m[1]);
+    const u = m[2].toUpperCase();
+    const mult = { K: 1e3, M: 1e6, G: 1e9, T: 1e12 }[u] || 1;
+    return Number.isFinite(base) ? base * mult : NaN;
+  }
+  const n = Number.parseFloat(t);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function kafkaPickCellInner(cell, ci, pick) {
   if (!pick || pick.index !== ci) return esc(cell == null ? "" : String(cell));
   const enc = encodeURIComponent(String(cell ?? ""));
@@ -937,9 +993,11 @@ function renderTable(rows, opts = {}) {
       const sortPart = opts.sortablePartitions && ci === 0;
       const sortCol = sortCols.includes(ci);
       const strSortCol = strSortCols.includes(ci);
+      const numByHeader = strSortCol && isNumericSortHeaderLabel(hdr[ci]);
+      const sortNumeric = sortCol || numByHeader;
       if (sortPart) {
         html += `<th class="th-sortable" data-sort-partitions title="Click to sort by partition count">${escCell(hdr[ci])}</th>`;
-      } else if (sortCol) {
+      } else if (sortNumeric) {
         html += `<th class="th-sortable" data-sort-col="${ci}" data-sort-kind="number" title="Click to sort asc/desc">${escCell(hdr[ci])}</th>`;
       } else if (strSortCol) {
         html += `<th class="th-sortable" data-sort-col="${ci}" data-sort-kind="string" title="Click to sort asc/desc">${escCell(hdr[ci])}</th>`;
@@ -1047,8 +1105,8 @@ function wireKafkaTableHeaderSort(tableRoot) {
           const cmp = sa.localeCompare(sb, undefined, { sensitivity: "base" });
           return mode === "desc" ? -cmp : cmp;
         }
-        const na = Number.parseFloat(sa.replace(/,/g, ""));
-        const nb = Number.parseFloat(sb.replace(/,/g, ""));
+        const na = parseCellSortNumber(sa);
+        const nb = parseCellSortNumber(sb);
         const va = Number.isFinite(na) ? na : 0;
         const vb = Number.isFinite(nb) ? nb : 0;
         return mode === "desc" ? vb - va : va - vb;
@@ -1092,6 +1150,24 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
         tableClass: "kafka-describe-summary-table",
       })}`;
     }
+    if (panelId === "leader_balance") {
+      const ins0 = j.leader_insights;
+      if (ins0 && Array.isArray(ins0.bullets) && ins0.bullets.length) {
+        inner += `<div class="leader-balance-insights"><p class="hint">Summary</p><ul class="leader-balance-insights-list">`;
+        for (const b of ins0.bullets) {
+          inner += `<li>${esc(String(b))}</li>`;
+        }
+        inner += `</ul></div>`;
+      }
+      if (j.leader_metrics_table && j.leader_metrics_table.length > 1) {
+        inner += `<p class="hint">Per-broker eligibility vs leadership</p>`;
+        inner += renderTable(j.leader_metrics_table, {
+          theadFirstRow: true,
+          sortableColumnIndexes: [1, 2, 3, 4, 5, 6],
+          tableClass: "kafka-lag-table",
+        });
+      }
+    }
     if (j.table && j.table.length) {
       if (panelId === "topic_describe") {
         inner += `<p class="hint">Partitions</p>${kafkaTopicDataTableScroll(
@@ -1131,19 +1207,45 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
           stringSortableColumnIndexes: hasSizeCol ? [] : [0],
           sortableColumnIndexes: hasSizeCol ? [1] : [],
         });
+      } else if (panelId === "leader_balance") {
+        inner += `<p class="hint">Partitions led per broker (from describe)</p>`;
+        inner += renderTable(j.table, {
+          theadFirstRow: true,
+          sortableColumnIndexes: [1],
+          tableClass: "kafka-lag-table",
+        });
       } else {
         inner += renderTable(j.table, { theadFirstRow: true });
       }
     }
-    if (panelId === "leader_balance" && j.leader_skew_table && j.leader_skew_table.length > 1) {
-      inner += `<p class="hint">Topic leadership skew (higher delta indicates less-even broker spread; use size to judge impact)</p>`;
-      inner += kafkaTopicDataTableScroll(
-        renderTable(j.leader_skew_table, {
-          theadFirstRow: true,
-          sortableColumnIndexes: [1, 2, 3, 4, 5, 6],
-          tableClass: "kafka-lag-table",
-        }),
-      );
+    if (panelId === "leader_balance") {
+      const ins = j.leader_insights;
+      if (j.leader_rf1_exclusion_table && j.leader_rf1_exclusion_table.length > 1) {
+        const fb = ins && ins.focus_broker != null ? String(ins.focus_broker) : "";
+        inner += `<p class="hint">RF=1 topics where broker ${esc(fb)} is never in the replica list (cannot be leader)</p>`;
+        inner += kafkaTopicDataTableScroll(
+          renderTable(j.leader_rf1_exclusion_table, {
+            theadFirstRow: true,
+            sortableColumnIndexes: [1],
+            stringSortableColumnIndexes: [0, 2, 3],
+            tableClass: "kafka-lag-table",
+          }),
+        );
+      }
+      if (j.leader_skew_table && j.leader_skew_table.length > 1) {
+        inner += `<p class="hint">Topics with uneven leadership spread within the topic (RF and replica brokers; delta = max−min leader counts)</p>`;
+        inner += kafkaTopicDataTableScroll(
+          renderTable(j.leader_skew_table, {
+            theadFirstRow: true,
+            sortableColumnIndexes: [1, 4, 5, 6, 7, 8],
+            stringSortableColumnIndexes: [0, 3],
+            tableClass: "kafka-lag-table",
+          }),
+        );
+      }
+      if (j.errors && j.errors.leader_balance_sizes) {
+        inner += `<p class="hint status-bad">Topic sizes unavailable: ${esc(String(j.errors.leader_balance_sizes))}</p>`;
+      }
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
     inner += kafkaPreWithWrapFooter(blobOut, {
@@ -1163,7 +1265,11 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
     }
     if (panelId === "topics_partition_counts") {
       wireTopicsPartitionSort(elOut);
-    } else if (panelId === "topic_describe" || panelId === "leader_balance") {
+    } else if (panelId === "leader_balance") {
+      for (const tbl of elOut.querySelectorAll("table")) {
+        if (tbl.querySelector("th[data-sort-col]")) wireKafkaTableHeaderSort(tbl);
+      }
+    } else if (panelId === "topic_describe") {
       const wrap = elOut.querySelector(".kafka-topic-table-scroll");
       if (wrap) wireKafkaTableHeaderSort(wrap);
     } else if (panelId === "consumer_groups_list") {
@@ -3430,7 +3536,7 @@ function renderKafka() {
   const brokerPanels = [
     ["Broker API versions", "broker_versions", "p-broker-ver", false, false],
     ["Broker default configs (describe)", "broker_default_configs", "p-broker-cfg", false, false],
-    ["Partition leadership balance", "leader_balance", "p-balance", false, false],
+    ["Partition leadership balance", "leader_balance", "p-balance", false, false, true],
   ];
   const topicPanels = [
     ["Topics × partition counts", "topics_partition_counts", "p-topics", false, false, false, true],
@@ -3764,11 +3870,9 @@ ${preWithCopy(c3)}`;
 
 function route() {
   stopWorkloadLogStream();
-  if (isCurrentHashWorkloadDisabled() || !isWorkloadRouteAvailable(location.hash || "#/")) {
-    location.hash = "#/";
-    return;
-  }
+  applyNavState();
   setActiveNav();
+  if (renderWorkloadGateCalloutIfBlocked()) return;
   const h = location.hash || "#/";
   if (hashMatchesRoute(h, "#/kafka-connect")) {
     renderKafkaConnect();
@@ -3791,10 +3895,15 @@ function route() {
 
 function boot() {
   footerStatus.textContent = `v${VERSION}`;
+  applyNavState();
   refreshK8sStrip();
   refreshSessionUi().then(route);
   setInterval(refreshK8sStrip, 20000);
-  setInterval(refreshSessionUi, 30000);
+  setInterval(() => {
+    void refreshSessionUi().then(() => {
+      if (renderWorkloadGateCalloutIfBlocked()) setActiveNav();
+    });
+  }, 30000);
   document.addEventListener("change", (ev) => {
     const t = ev.target;
     if (!(t instanceof HTMLInputElement) || !t.classList.contains("js-pre-wrap")) return;
@@ -3807,7 +3916,7 @@ function boot() {
 }
 
 window.addEventListener("hashchange", () => {
-  refreshSessionUi().then(route);
+  route();
 });
 
 boot();

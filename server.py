@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.31"
+VERSION = "1.0.38"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -1161,7 +1161,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if m and int(m.group(2)) > 0:
                         rows.append([m.group(1), m.group(2)])
                 out["table"] = [["Broker id", "Partitions led"]] + rows
-                # Add topic-level skew + size context to judge if broker deltas are meaningful.
+                size_mb: dict[str, str] = {}
                 r_du = kx.kafka_bash_exec(
                     ns,
                     "du -sk /bitnami/kafka/data/* 2>/dev/null | sort -rn | head -n 600",
@@ -1171,17 +1171,21 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 if r_du.ok:
                     by_topic = kparse.aggregate_du_kafka_data_by_topic(r_du.stdout or "")
-                    size_mb: dict[str, str] = {}
                     if len(by_topic) > 1:
                         for rr in by_topic[1:]:
                             if len(rr) >= 2:
                                 size_mb[str(rr[0])] = str(rr[1])
-                    skew_tbl = kparse.parse_topic_leader_skew(describe_part or "", topic_sizes_mb=size_mb)
-                    if skew_tbl:
-                        out["leader_skew_table"] = skew_tbl
                 else:
                     out.setdefault("errors", {})
                     out["errors"]["leader_balance_sizes"] = kx.filter_kubectl_noise(r_du.stderr) or "du scan failed"
+                led_map = {str(rr[0]): int(rr[1]) for rr in rows}
+                bundle = kparse.build_leader_balance_insights(
+                    describe_part or "",
+                    broker_led=led_map,
+                    topic_sizes_mb=size_mb,
+                )
+                if bundle:
+                    out.update(bundle)
             elif panel == "consumer_groups_list":
                 list_body, desc_body = kparse.consumer_groups_list_split_panel_stdout(r.stdout or "")
                 names = kparse.parse_consumer_group_names(list_body)
@@ -1453,20 +1457,15 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
                     return
             else:
-                ns = kx.discover_namespace_for_pod(kx.KAFKA_POD, aws_profile=aws_profile, cloud=cloud)
-                if not ns:
-                    self._json(
-                        {"ok": False, "error": f"Pod {kx.KAFKA_POD} not found in any namespace (kubectl get pod -A)."},
-                        HTTPStatus.NOT_FOUND,
-                    )
-                    return
-            pod = kx.kubectl_get_pod(ns, aws_profile=aws_profile, cloud=cloud)
-            if not pod.ok:
+                # Default namespace even when Kafka (or other workloads) is absent.
+                ns = "default"
+            ns_probe = kx.kubectl_list_pod_names(ns, aws_profile=aws_profile, cloud=cloud)
+            if not ns_probe.ok:
                 self._json(
                     {
                         "ok": False,
-                        "error": f"Cannot reach pod {kx.KAFKA_POD} in namespace {ns!r}.",
-                        "detail": kx.filter_kubectl_noise(pod.stderr),
+                        "error": f"Cannot access namespace {ns!r}.",
+                        "detail": kx.filter_kubectl_noise(ns_probe.stderr),
                     },
                     HTTPStatus.BAD_GATEWAY,
                 )
@@ -1507,7 +1506,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "current_context": current_context,
                     "cluster_server": cluster_server,
                     "cluster_info": (info.stdout or "").strip()[:2000],
-                    "pod_line": (pod.stdout or "").strip()[:2000],
+                    "pod_line": "",
                     "stack": stack_info,
                     "clickhouse_password_configured": bool(sens.read_clickhouse_password()),
                     "postgres_password_configured": bool(sens.read_postgres_password()),

@@ -235,6 +235,254 @@ def aggregate_du_kafka_data_by_topic(stdout: str) -> list[list[str]]:
     return [["Topic", "Size (MB)"]] + [[t, f"{kb / 1024.0:.2f}"] for t, kb in rows_sorted]
 
 
+def _iter_describe_partitions(describe_stdout: str) -> list[dict[str, Any]]:
+    """
+    Walk ``kafka-topics --describe`` output in order: topic summary lines set RF,
+    partition lines attach to the current topic.
+    """
+    out: list[dict[str, Any]] = []
+    cur_rf = 0
+    for raw in (describe_stdout or "").splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        tm = _TOPIC_SUMMARY_RE.match(ln)
+        if tm:
+            try:
+                cur_rf = int(tm.group("ReplicationFactor"))
+            except (TypeError, ValueError):
+                cur_rf = 0
+            continue
+        pm = _PART_LINE_RE.search(ln)
+        if not pm:
+            continue
+        topic = pm.group("topic")
+        leader = pm.group("leader").strip()
+        replicas = pm.group("replicas")
+        rep_set = {b.strip() for b in replicas.split(",") if re.fullmatch(r"\d+", b.strip())}
+        out.append(
+            {
+                "topic": topic,
+                "partition": pm.group("partition"),
+                "leader": leader if re.fullmatch(r"\d+", leader) else "",
+                "replicas": rep_set,
+                "rf": cur_rf,
+            }
+        )
+    return out
+
+
+def build_leader_balance_insights(
+    describe_stdout: str,
+    *,
+    broker_led: dict[str, int] | None = None,
+    topic_sizes_mb: dict[str, str] | None = None,
+    skew_limit: int = 40,
+    rf1_exclusion_limit: int = 30,
+) -> dict[str, Any]:
+    """
+    Explain uneven ``Partitions led`` totals: eligibility (replica placement) vs true skew.
+
+    Returns JSON-serializable keys (omit empty):
+    - ``leader_insights``: ``{ "bullets": [...], "focus_broker": str }``
+    - ``leader_metrics_table``: per-broker metrics
+    - ``leader_rf1_exclusion_table``: largest RF=1 topics where focus broker never appears in replicas
+    - ``leader_skew_table``: topic rows with RF + replica-union context (replaces plain skew-only table)
+    """
+    topic_sizes = topic_sizes_mb or {}
+    parts = _iter_describe_partitions(describe_stdout)
+    if not parts:
+        return {}
+
+    all_brokers: set[str] = set()
+    for p in parts:
+        all_brokers |= p["replicas"]
+        if p["leader"]:
+            all_brokers.add(p["leader"])
+    led_pre = broker_led or {}
+    for b in led_pre:
+        bs = str(b).strip()
+        if re.fullmatch(r"\d+", bs):
+            all_brokers.add(bs)
+    broker_ids = sorted(all_brokers, key=int)
+
+    eligible: dict[str, int] = {b: 0 for b in broker_ids}
+    led_from_describe: dict[str, int] = {b: 0 for b in broker_ids}
+    rf1_not_in_replica: dict[str, int] = {b: 0 for b in broker_ids}
+    rf1_total = 0
+
+    for p in parts:
+        rf = int(p.get("rf") or 0)
+        reps: set[str] = p["replicas"]
+        for b in broker_ids:
+            if b in reps:
+                eligible[b] += 1
+        ld = p.get("leader") or ""
+        if ld in led_from_describe:
+            led_from_describe[ld] += 1
+        if rf == 1:
+            rf1_total += 1
+            for b in broker_ids:
+                if b not in reps:
+                    rf1_not_in_replica[b] += 1
+
+    led: dict[str, int] = {}
+    if broker_led:
+        for k, v in broker_led.items():
+            ks = str(k).strip()
+            if re.fullmatch(r"\d+", ks):
+                try:
+                    led[ks] = int(v)
+                except (TypeError, ValueError):
+                    led[ks] = 0
+    if not led:
+        led = dict(led_from_describe)
+    else:
+        for b in broker_ids:
+            led.setdefault(b, int(led_from_describe.get(b, 0)))
+
+    total_parts = len(parts)
+    focus_broker = min(broker_ids, key=lambda bid: int(led.get(bid, 0)))
+
+    approx_mb_led: dict[str, float] = {b: 0.0 for b in broker_ids}
+    by_topic: dict[str, dict[str, Any]] = {}
+    for p in parts:
+        t = p["topic"]
+        row = by_topic.setdefault(t, {"parts": 0, "rf": 0, "replicas": set(), "leader_counts": {}})
+        row["parts"] += 1
+        row["rf"] = int(p.get("rf") or 0)
+        row["replicas"] |= p["replicas"]
+        ld = p.get("leader") or ""
+        if ld:
+            lc = row["leader_counts"]
+            lc[ld] = lc.get(ld, 0) + 1
+
+    for t, row in by_topic.items():
+        prt = int(row["parts"] or 0)
+        if prt <= 0:
+            continue
+        sz_raw = topic_sizes.get(t, "")
+        sz = 0.0
+        if isinstance(sz_raw, str) and re.fullmatch(r"\d+(\.\d+)?", sz_raw.strip()):
+            sz = float(sz_raw.strip())
+        lc: dict[str, int] = row.get("leader_counts") or {}
+        for b in broker_ids:
+            c = int(lc.get(b, 0))
+            approx_mb_led[b] += sz * (float(c) / float(prt))
+
+    bullets: list[str] = []
+    bullets.append(
+        f"Brokers observed in describe output: {', '.join(broker_ids)}. "
+        f"Total partitions: {total_parts}. Replication-factor 1 partitions: {rf1_total}."
+    )
+    eb = eligible.get(focus_broker, 0)
+    lb = int(led.get(focus_broker, 0))
+    pct_elig = (100.0 * float(lb) / float(eb)) if eb > 0 else 0.0
+    miss = rf1_not_in_replica.get(focus_broker, 0)
+    bullets.append(
+        f"Broker {focus_broker} leads {lb} partitions but is only in the replica set for {eb} of {total_parts} "
+        f"partitions ({100.0 * float(eb) / float(total_parts):.1f}% of the cluster). "
+        f"Of RF=1 partitions, {miss} never place a replica on broker {focus_broker}, so that broker can never "
+        f"be elected leader for those partitions. Low leader counts are often mostly a placement story, not "
+        f"\"lost leadership\" on otherwise-eligible partitions."
+    )
+    bullets.append(
+        "Approximate topic-size share by leadership (each topic's reported Size (MB) × fraction of partitions "
+        "led on that broker). This compares relative hotness of leader traffic, not actual on-disk bytes "
+        f"(replication not modeled): "
+        + ", ".join(f"{b}≈{approx_mb_led[b]:.1f} MB" for b in broker_ids)
+        + "."
+    )
+
+    hdr_metrics = [
+        "Broker",
+        "Partitions led (from describe counts)",
+        "Eligible partitions (in replica set)",
+        "% of cluster partitions eligible",
+        "% of eligible partitions where this broker is leader",
+        "RF=1 partitions never placing a replica on this broker",
+        "Approx MB as leader (topic size × leader share)",
+    ]
+    metrics_rows: list[list[str]] = []
+    for b in broker_ids:
+        el = eligible.get(b, 0)
+        lbc = int(led.get(b, 0))
+        pct_clu = (100.0 * float(el) / float(total_parts)) if total_parts > 0 else 0.0
+        pct_led = (100.0 * float(lbc) / float(el)) if el > 0 else 0.0
+        metrics_rows.append(
+            [
+                b,
+                str(lbc),
+                str(el),
+                f"{pct_clu:.1f}",
+                f"{pct_led:.1f}",
+                str(rf1_not_in_replica.get(b, 0)),
+                f"{approx_mb_led[b]:.2f}",
+            ]
+        )
+
+    rf1_topics: list[tuple[int, str, str, str]] = []
+    for t, row in by_topic.items():
+        if int(row.get("rf") or 0) != 1:
+            continue
+        reps: set[str] = row.get("replicas") or set()
+        if focus_broker in reps:
+            continue
+        prt = int(row["parts"] or 0)
+        rep_s = ",".join(sorted(reps, key=int))
+        sz = topic_sizes.get(t, "N/A")
+        rf1_topics.append((prt, t, rep_s, str(sz)))
+    rf1_topics.sort(key=lambda x: (-x[0], x[1].casefold()))
+    rf1_tbl: list[list[str]] = []
+    if rf1_topics:
+        rf1_hdr = [
+            "Topic (RF=1, broker "
+            + focus_broker
+            + " never in replicas)",
+            "Partitions",
+            "Replica broker(s) used",
+            "Size (MB)",
+        ]
+        rf1_tbl = [rf1_hdr] + [
+            [tp, str(pc), rs, sz] for pc, tp, rs, sz in rf1_topics[: max(1, int(rf1_exclusion_limit))]
+        ]
+
+    skew_tbl = parse_topic_leader_skew(
+        describe_stdout,
+        topic_sizes_mb=topic_sizes,
+        min_partitions=2,
+        limit=int(skew_limit),
+    )
+    skew_enhanced: list[list[str]] = []
+    if skew_tbl:
+        old_hdr = skew_tbl[0]
+        new_hdr = (
+            ["Topic", "Partitions", "RF", "Replica brokers (union)"]
+            + old_hdr[2:]
+            if len(old_hdr) >= 7
+            else old_hdr
+        )
+        skew_enhanced.append(new_hdr)
+        for r in skew_tbl[1:]:
+            if len(r) < 7:
+                continue
+            topic, pcount, mx, mn, delta, pct, sz = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+            tr = by_topic.get(topic) or {}
+            rf_s = str(int(tr.get("rf") or 0))
+            rep_u = ",".join(sorted(tr.get("replicas") or set(), key=int)) if tr else ""
+            skew_enhanced.append([topic, pcount, rf_s, rep_u, mx, mn, delta, pct, sz])
+
+    out: dict[str, Any] = {
+        "leader_insights": {"bullets": bullets, "focus_broker": focus_broker},
+        "leader_metrics_table": [hdr_metrics] + metrics_rows,
+    }
+    if rf1_tbl:
+        out["leader_rf1_exclusion_table"] = rf1_tbl
+    if skew_enhanced:
+        out["leader_skew_table"] = skew_enhanced
+    return out
+
+
 def parse_topic_leader_skew(
     describe_stdout: str,
     *,

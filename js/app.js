@@ -27,7 +27,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.38";
+const VERSION = "2.0.1";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -1052,6 +1052,74 @@ function wireTopicsPartitionSort(elOut) {
   });
 }
 
+/** Human label for a leader-balance driver status. */
+const LEADER_BALANCE_STATUS_LABEL = {
+  balanced: "Green",
+  "mildly-skewed": "Amber",
+  "heavily-skewed": "Red",
+  "single-broker": "N/A",
+  unknown: "Unknown",
+};
+
+/**
+ * Render the structured leader-balance summary block.
+ * Each driver gets its own status card with a headline and a sortable table.
+ * Empty string when ``summary`` is missing — caller can prepend without checks.
+ * @param {unknown} summary
+ */
+function renderLeaderBalanceSummaryHtml(summary) {
+  if (!summary || typeof summary !== "object") return "";
+  const s = /** @type {{ broker_count?: number, broker_ids?: string[], drivers?: Array<{ id?: string, label?: string, status?: string, headline?: string, table?: string[][], table_caption?: string }> }} */ (summary);
+  const drivers = Array.isArray(s.drivers) ? s.drivers : [];
+  if (!drivers.length) return "";
+  const brokerCount = typeof s.broker_count === "number" ? s.broker_count : null;
+  let html = `<div class="leader-balance-summary">`;
+  if (brokerCount != null) {
+    html += `<p class="leader-balance-cluster-meta muted">Brokers detected: <strong>${esc(String(brokerCount))}</strong>${
+      Array.isArray(s.broker_ids) && s.broker_ids.length ? ` (${esc(s.broker_ids.join(", "))})` : ""
+    }</p>`;
+  }
+  html += `<div class="leader-balance-drivers">`;
+  for (const d of drivers) {
+    const status = String(d.status || "unknown");
+    const label = LEADER_BALANCE_STATUS_LABEL[status] || LEADER_BALANCE_STATUS_LABEL.unknown;
+    const driverLabel = String(d.label || d.id || "");
+    const headline = String(d.headline || "");
+    html += `<section class="leader-balance-driver leader-balance-driver--${esc(status)}">`;
+    html += `<header class="leader-balance-driver-head">`;
+    html += `<h3 class="leader-balance-driver-title">${esc(driverLabel)}</h3>`;
+    html += `<span class="leader-balance-badge leader-balance-badge--${esc(status)}">${esc(label)}</span>`;
+    html += `</header>`;
+    if (headline) html += `<p class="leader-balance-driver-headline">${esc(headline)}</p>`;
+    if (Array.isArray(d.table) && d.table.length > 1) {
+      const cols = d.table[0].length || 0;
+      const stringCols = [];
+      const numericCols = [];
+      for (let i = 0; i < cols; i++) {
+        if (i === 0 || (d.id === "rf1" && i === 3) || (d.id === "topic_spread" && i === 3)) {
+          stringCols.push(i);
+        } else {
+          numericCols.push(i);
+        }
+      }
+      html += kafkaTopicDataTableScroll(
+        renderTable(d.table, {
+          theadFirstRow: true,
+          tableClass: "kafka-lag-table",
+          sortableColumnIndexes: numericCols,
+          stringSortableColumnIndexes: stringCols,
+        }),
+      );
+      if (d.table_caption) {
+        html += `<p class="leader-balance-driver-caption muted">${esc(String(d.table_caption))}</p>`;
+      }
+    }
+    html += `</section>`;
+  }
+  html += `</div></div>`;
+  return html;
+}
+
 /** Rebalancing panel: one row per topic, checkbox column for topics-to-move JSON. */
 function renderRebalanceTopicTableScroll(table) {
   if (!table || table.length < 2) {
@@ -1151,21 +1219,15 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
       })}`;
     }
     if (panelId === "leader_balance") {
-      const ins0 = j.leader_insights;
-      if (ins0 && Array.isArray(ins0.bullets) && ins0.bullets.length) {
-        inner += `<div class="leader-balance-insights"><p class="hint">Summary</p><ul class="leader-balance-insights-list">`;
-        for (const b of ins0.bullets) {
-          inner += `<li>${esc(String(b))}</li>`;
-        }
-        inner += `</ul></div>`;
-      }
+      inner += renderLeaderBalanceSummaryHtml(j.leader_summary);
       if (j.leader_metrics_table && j.leader_metrics_table.length > 1) {
-        inner += `<p class="hint">Per-broker eligibility vs leadership</p>`;
+        inner += `<details class="leader-balance-details" open><summary>Per-broker metrics (eligibility, leadership, approx bytes)</summary>`;
         inner += renderTable(j.leader_metrics_table, {
           theadFirstRow: true,
           sortableColumnIndexes: [1, 2, 3, 4, 5, 6],
           tableClass: "kafka-lag-table",
         });
+        inner += `</details>`;
       }
     }
     if (j.table && j.table.length) {
@@ -1208,12 +1270,13 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
           sortableColumnIndexes: hasSizeCol ? [1] : [],
         });
       } else if (panelId === "leader_balance") {
-        inner += `<p class="hint">Partitions led per broker (from describe)</p>`;
+        inner += `<details class="leader-balance-details" open><summary>Partitions led per broker (raw counts from describe)</summary>`;
         inner += renderTable(j.table, {
           theadFirstRow: true,
           sortableColumnIndexes: [1],
           tableClass: "kafka-lag-table",
         });
+        inner += `</details>`;
       } else {
         inner += renderTable(j.table, { theadFirstRow: true });
       }
@@ -1222,7 +1285,7 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
       const ins = j.leader_insights;
       if (j.leader_rf1_exclusion_table && j.leader_rf1_exclusion_table.length > 1) {
         const fb = ins && ins.focus_broker != null ? String(ins.focus_broker) : "";
-        inner += `<p class="hint">RF=1 topics where broker ${esc(fb)} is never in the replica list (cannot be leader)</p>`;
+        inner += `<details class="leader-balance-details" open><summary>RF=1 topics where broker ${esc(fb)} is never in the replica list (cannot be leader)</summary>`;
         inner += kafkaTopicDataTableScroll(
           renderTable(j.leader_rf1_exclusion_table, {
             theadFirstRow: true,
@@ -1231,9 +1294,10 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
             tableClass: "kafka-lag-table",
           }),
         );
+        inner += `</details>`;
       }
       if (j.leader_skew_table && j.leader_skew_table.length > 1) {
-        inner += `<p class="hint">Topics with uneven leadership spread within the topic (RF and replica brokers; delta = max−min leader counts)</p>`;
+        inner += `<details class="leader-balance-details" open><summary>Topics with uneven leadership spread inside the topic (Δ = max − min leader counts across replica brokers)</summary>`;
         inner += kafkaTopicDataTableScroll(
           renderTable(j.leader_skew_table, {
             theadFirstRow: true,
@@ -1242,9 +1306,10 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
             tableClass: "kafka-lag-table",
           }),
         );
+        inner += `</details>`;
       }
       if (j.errors && j.errors.leader_balance_sizes) {
-        inner += `<p class="hint status-bad">Topic sizes unavailable: ${esc(String(j.errors.leader_balance_sizes))}</p>`;
+        inner += `<p class="hint status-bad">Topic sizes unavailable (Rebalancing scan needed for byte estimates): ${esc(String(j.errors.leader_balance_sizes))}</p>`;
       }
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
@@ -3489,9 +3554,14 @@ function renderKafka() {
       <div id="kafka-grid-groups"></div>
     </section>
 
+    <section class="kafka-subject" aria-labelledby="kafka-subject-balance">
+      <h2 class="kafka-subject-title" id="kafka-subject-balance">Partition leadership balance</h2>
+      <div class="panels-grid" id="kafka-grid-balance"></div>
+    </section>
+
     <section class="panel panel--span-all kafka-rebalance-section">
       <div class="panel-head">
-        <h2>Rebalancing</h2>
+        <h2>Rebalancing Helper</h2>
         <div class="panel-actions">
           <button type="button" class="btn btn-primary" id="rebalance-analyze-btn">Activate</button>
         </div>
@@ -3536,7 +3606,9 @@ function renderKafka() {
   const brokerPanels = [
     ["Broker API versions", "broker_versions", "p-broker-ver", false, false],
     ["Broker default configs (describe)", "broker_default_configs", "p-broker-cfg", false, false],
-    ["Partition leadership balance", "leader_balance", "p-balance", false, false, true],
+  ];
+  const balancePanels = [
+    ["Partition leadership balance", "leader_balance", "p-balance", false, false, true, false, "panel--leader-balance", "activate"],
   ];
   const topicPanels = [
     ["Topics × partition counts", "topics_partition_counts", "p-topics", false, false, false, true],
@@ -3624,7 +3696,9 @@ function renderKafka() {
     </div>`;
   }
 
+  const gridBalance = app.querySelector("#kafka-grid-balance");
   fillKafkaGrid(gridBrokers, brokerPanels);
+  fillKafkaGrid(gridBalance, balancePanels);
   fillKafkaGrid(gridTopics, topicPanels);
   fillKafkaGroupsLayout(gridGroups, groupPanelsLeft, groupPanelsRight, groupPanelsLag);
 
@@ -3796,6 +3870,7 @@ ${preWithCopy(c3)}`;
   }
 
   wireKafkaRows(gridBrokers, brokerPanels);
+  wireKafkaRows(gridBalance, balancePanels);
   wireKafkaRows(gridTopics, topicPanels);
   wireKafkaRows(gridGroups, [...groupPanelsLeft, ...groupPanelsRight, ...groupPanelsLag]);
 

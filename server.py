@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.38"
+VERSION = "2.0.1"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402

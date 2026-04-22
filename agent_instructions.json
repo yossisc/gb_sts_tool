@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.38",
+    "app_version": "2.0.1",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",

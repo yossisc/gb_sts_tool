@@ -4,16 +4,20 @@ Known Glassbox stack components: pod name prefixes used to count replicas in the
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypedDict
 
 from backend import k8s_exec as kx
 
 
-class ComponentSpec(TypedDict):
+class ComponentSpec(TypedDict, total=False):
     id: str
     label: str
     pod_prefixes: list[str]
     notes: str
+    # Optional: precise regex applied AFTER prefix match to count only true workload pods.
+    # Used e.g. for kafka where ``glassbox-kafka-`` also matches the exporter Deployment.
+    pod_pattern: str
 
 
 # Reaching glassbox-kafka-0 (or any replica) is enough for cluster-wide Kafka tools; same idea for ES/OS.
@@ -22,6 +26,7 @@ STACK_COMPONENTS: list[ComponentSpec] = [
         "id": "kafka",
         "label": "Kafka",
         "pod_prefixes": ["glassbox-kafka-"],
+        "pod_pattern": r"^glassbox-kafka-\d+$",
         "notes": "StatefulSet prefix; use pod 0 for cluster-wide kafka tools.",
     },
     {
@@ -95,10 +100,15 @@ def probe_stack_in_namespace(
     names = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
     components: dict[str, Any] = {}
     for spec in STACK_COMPONENTS:
+        pattern = spec.get("pod_pattern")
+        rx = re.compile(pattern) if pattern else None
         matched: list[str] = []
         for name in names:
-            if any(name.startswith(prefix) for prefix in spec["pod_prefixes"]):
-                matched.append(name)
+            if not any(name.startswith(prefix) for prefix in spec["pod_prefixes"]):
+                continue
+            if rx is not None and not rx.match(name):
+                continue
+            matched.append(name)
         matched.sort()
         components[spec["id"]] = {
             "label": spec["label"],

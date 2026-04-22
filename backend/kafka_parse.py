@@ -370,28 +370,15 @@ def build_leader_balance_insights(
             c = int(lc.get(b, 0))
             approx_mb_led[b] += sz * (float(c) / float(prt))
 
-    bullets: list[str] = []
-    bullets.append(
-        f"Brokers observed in describe output: {', '.join(broker_ids)}. "
-        f"Total partitions: {total_parts}. Replication-factor 1 partitions: {rf1_total}."
-    )
-    eb = eligible.get(focus_broker, 0)
-    lb = int(led.get(focus_broker, 0))
-    pct_elig = (100.0 * float(lb) / float(eb)) if eb > 0 else 0.0
-    miss = rf1_not_in_replica.get(focus_broker, 0)
-    bullets.append(
-        f"Broker {focus_broker} leads {lb} partitions but is only in the replica set for {eb} of {total_parts} "
-        f"partitions ({100.0 * float(eb) / float(total_parts):.1f}% of the cluster). "
-        f"Of RF=1 partitions, {miss} never place a replica on broker {focus_broker}, so that broker can never "
-        f"be elected leader for those partitions. Low leader counts are often mostly a placement story, not "
-        f"\"lost leadership\" on otherwise-eligible partitions."
-    )
-    bullets.append(
-        "Approximate topic-size share by leadership (each topic's reported Size (MB) × fraction of partitions "
-        "led on that broker). This compares relative hotness of leader traffic, not actual on-disk bytes "
-        f"(replication not modeled): "
-        + ", ".join(f"{b}≈{approx_mb_led[b]:.1f} MB" for b in broker_ids)
-        + "."
+    summary = _build_leader_balance_summary(
+        broker_ids=broker_ids,
+        total_parts=total_parts,
+        rf1_total=rf1_total,
+        led=led,
+        approx_mb_led=approx_mb_led,
+        rf1_not_in_replica=rf1_not_in_replica,
+        by_topic=by_topic,
+        topic_sizes=topic_sizes,
     )
 
     hdr_metrics = [
@@ -473,7 +460,8 @@ def build_leader_balance_insights(
             skew_enhanced.append([topic, pcount, rf_s, rep_u, mx, mn, delta, pct, sz])
 
     out: dict[str, Any] = {
-        "leader_insights": {"bullets": bullets, "focus_broker": focus_broker},
+        "leader_insights": {"focus_broker": focus_broker},
+        "leader_summary": summary,
         "leader_metrics_table": [hdr_metrics] + metrics_rows,
     }
     if rf1_tbl:
@@ -481,6 +469,342 @@ def build_leader_balance_insights(
     if skew_enhanced:
         out["leader_skew_table"] = skew_enhanced
     return out
+
+
+def _fmt_size_mb(mb: float) -> str:
+    """Render an approximate MB number with GB rollup when large; whole numbers when small."""
+    if mb >= 1024.0:
+        return f"{mb / 1024.0:.1f} GB"
+    if mb >= 10.0:
+        return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB"
+
+
+def _topic_size_mb_float(topic_sizes: dict[str, str], topic: str) -> float:
+    """Read the size cell from the rebalance scan; returns 0.0 when not parseable."""
+    raw = topic_sizes.get(topic, "")
+    if not isinstance(raw, str):
+        return 0.0
+    s = raw.strip()
+    m = re.match(r"\d+(\.\d+)?", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _topic_cluster_imbalance_pct(partitions: int, leader_counts_per_cluster_broker: list[int]) -> float:
+    """Cluster-wide leader imbalance for a single topic, expressed as percent of partitions.
+
+    Compares the topic's actual leader counts (one entry per cluster broker, including
+    zero for brokers not in the replica set) against the most balanced possible
+    distribution of ``partitions`` partitions across ``N`` brokers (q = partitions // N
+    on N-r brokers and q+1 on r brokers, where r = partitions % N). The metric is the
+    sum of absolute deviations between the sorted actual and sorted ideal vectors,
+    halved (so it counts each misplaced partition once), then normalized by partitions.
+
+    Returns 0.0 for a perfectly spread topic and approaches 100% when all partitions
+    are pinned to a single broker on a multi-broker cluster. Single-partition topics
+    always score 0% because the ideal distribution is also "all on one broker".
+    """
+
+    if partitions <= 0 or not leader_counts_per_cluster_broker:
+        return 0.0
+    n = len(leader_counts_per_cluster_broker)
+    if n <= 1:
+        return 0.0
+    q, r = divmod(partitions, n)
+    ideal_sorted = [q] * (n - r) + [q + 1] * r
+    actual_sorted = sorted(int(x) for x in leader_counts_per_cluster_broker)
+    displacement = sum(abs(a - i) for a, i in zip(actual_sorted, ideal_sorted)) / 2.0
+    return 100.0 * displacement / float(partitions)
+
+
+def _build_leader_balance_summary(
+    *,
+    broker_ids: list[str],
+    total_parts: int,
+    rf1_total: int,
+    led: dict[str, int],
+    approx_mb_led: dict[str, float],
+    rf1_not_in_replica: dict[str, int],
+    by_topic: dict[str, dict[str, Any]],
+    topic_sizes: dict[str, str],
+) -> dict[str, Any]:
+    """
+    Compact leader-balance verdict split into three independent drivers.
+
+    Returns ``{ "broker_count": int, "broker_ids": [...], "drivers": [...] }``.
+
+    Each driver is::
+
+        {
+          "id": "topic_spread" | "partition_count" | "rf1",
+          "label": "...",
+          "status": "balanced" | "mildly-skewed" | "heavily-skewed" |
+                    "single-broker" | "unknown",
+          "headline": "short status sentence",
+          "table": [[ "header...", ... ], [ "row...", ... ], ...],   # optional
+          "table_caption": "...",                                    # optional
+        }
+
+    Generic for any broker count ≥ 1.
+    """
+    n = len(broker_ids)
+    if n == 0:
+        return {
+            "broker_count": 0,
+            "broker_ids": [],
+            "drivers": [
+                {
+                    "id": "topic_spread",
+                    "label": "Largest topics spread",
+                    "status": "unknown",
+                    "headline": "No brokers detected in describe output.",
+                },
+                {
+                    "id": "partition_count",
+                    "label": "Partition count spread",
+                    "status": "unknown",
+                    "headline": "No brokers detected in describe output.",
+                },
+                {
+                    "id": "rf1",
+                    "label": "RF=1 topics",
+                    "status": "unknown",
+                    "headline": "No brokers detected in describe output.",
+                },
+            ],
+        }
+
+    drivers: list[dict[str, Any]] = []
+
+    # ---------- (a) Largest topics spread ----------
+    # Cluster-wide imbalance per topic: compare actual leader counts (across ALL N
+    # cluster brokers, including 0 for brokers not in the replica set) vs the most
+    # balanced possible distribution of `partitions` across N brokers. Weight the
+    # status by topic size so a few huge skewed topics correctly drive the verdict.
+    largest_with_size: list[tuple[float, str, dict[str, Any]]] = []
+    for t, row in by_topic.items():
+        sz = _topic_size_mb_float(topic_sizes, t)
+        if sz <= 0:
+            continue
+        largest_with_size.append((sz, t, row))
+    largest_with_size.sort(key=lambda x: -x[0])
+    top_n = largest_with_size[:10]
+
+    ts_status = "balanced"
+    ts_headline: str
+    ts_table: list[list[str]] = []
+    ts_caption = ""
+
+    if n == 1:
+        ts_status = "single-broker"
+        ts_headline = (
+            "Single-broker cluster — leader spread does not apply (every partition is led by the only broker)."
+        )
+    elif not top_n:
+        ts_status = "unknown"
+        ts_headline = (
+            "Topic sizes are not available yet — run the Rebalancing Helper scan below to populate disk usage."
+        )
+    else:
+        ts_table = [["Topic", "Size", "Partitions", "Replica brokers", "Imbalance %", "Misplaced size"]]
+        rows_for_sort: list[tuple[float, list[str]]] = []
+        total_size_mb = 0.0
+        total_misplaced_mb = 0.0
+        for sz, t, row in top_n:
+            prt = int(row.get("parts") or 0)
+            reps = row.get("replicas") or set()
+            lc: dict[str, int] = row.get("leader_counts") or {}
+            counts_per_cluster = [int(lc.get(b, 0)) for b in broker_ids]
+            imb_pct = _topic_cluster_imbalance_pct(prt, counts_per_cluster)
+            misplaced_mb = sz * imb_pct / 100.0
+            total_size_mb += sz
+            total_misplaced_mb += misplaced_mb
+            rep_label = (
+                ",".join(sorted(reps, key=lambda x: int(x) if str(x).isdigit() else 0)) if reps else ""
+            )
+            rows_for_sort.append(
+                (
+                    sz,
+                    [
+                        t,
+                        _fmt_size_mb(sz),
+                        str(prt),
+                        rep_label,
+                        f"{imb_pct:.1f}",
+                        _fmt_size_mb(misplaced_mb) if misplaced_mb > 0 else "0",
+                    ],
+                )
+            )
+        rows_for_sort.sort(key=lambda x: -x[0])
+        for _, r in rows_for_sort:
+            ts_table.append(r)
+
+        misplaced_pct = (100.0 * total_misplaced_mb / total_size_mb) if total_size_mb > 0 else 0.0
+        ts_caption = (
+            f"Top {len(top_n)} topic(s) by size. Imbalance % = how far the topic's leader distribution "
+            f"is from the most-even split across all {n} cluster brokers (0% = perfectly spread). "
+            f"Misplaced MB = Size × Imbalance %."
+        )
+        if misplaced_pct <= 5.0:
+            ts_status = "balanced"
+            ts_headline = (
+                f"~{misplaced_pct:.1f}% of top-{len(top_n)} topic bytes are misplaced — "
+                f"the largest topics are well-spread across all {n} brokers."
+            )
+        elif misplaced_pct <= 20.0:
+            ts_status = "mildly-skewed"
+            ts_headline = (
+                f"~{misplaced_pct:.1f}% of top-{len(top_n)} topic bytes are misplaced "
+                f"(~{_fmt_size_mb(total_misplaced_mb)} of {_fmt_size_mb(total_size_mb)})."
+            )
+        else:
+            ts_status = "heavily-skewed"
+            ts_headline = (
+                f"~{misplaced_pct:.1f}% of top-{len(top_n)} topic bytes are misplaced "
+                f"(~{_fmt_size_mb(total_misplaced_mb)} of {_fmt_size_mb(total_size_mb)}) — "
+                f"the largest topics are not spread evenly across all {n} brokers."
+            )
+
+    drivers.append(
+        {
+            "id": "topic_spread",
+            "label": "Largest topics spread",
+            "status": ts_status,
+            "headline": ts_headline,
+            "table": ts_table,
+            "table_caption": ts_caption,
+        }
+    )
+
+    # ---------- (b) Partition count spread ----------
+    counts_list = [int(led.get(b, 0)) for b in broker_ids]
+    total_led = sum(counts_list)
+    mean_count = (total_led / n) if n > 0 else 0.0
+    mx_count = max(counts_list) if counts_list else 0
+    mn_count = min(counts_list) if counts_list else 0
+    counts_spread_pct = (100.0 * (mx_count - mn_count) / mean_count) if mean_count > 0 else 0.0
+    max_b_count = max(broker_ids, key=lambda b: int(led.get(b, 0)))
+    min_b_count = min(broker_ids, key=lambda b: int(led.get(b, 0)))
+
+    pc_table: list[list[str]] = [["Broker", "Partitions led", "% of cluster"]]
+    pc_rows: list[tuple[int, list[str]]] = []
+    for b in broker_ids:
+        c = int(led.get(b, 0))
+        pct = (100.0 * c / float(total_parts)) if total_parts > 0 else 0.0
+        pc_rows.append((c, [b, f"{c:,}", f"{pct:.1f}"]))
+    pc_rows.sort(key=lambda x: -x[0])
+    for _, row in pc_rows:
+        pc_table.append(row)
+
+    if n == 1:
+        pc_status = "single-broker"
+        pc_headline = "Single-broker cluster — partition count spread does not apply."
+    elif counts_spread_pct <= 30.0:
+        pc_status = "balanced"
+        pc_headline = (
+            f"Partition count spread Δ {counts_spread_pct:.1f}% — even across {n} brokers "
+            f"(broker {max_b_count}: {int(led.get(max_b_count, 0)):,}, broker {min_b_count}: "
+            f"{int(led.get(min_b_count, 0)):,})."
+        )
+    elif counts_spread_pct <= 100.0:
+        pc_status = "mildly-skewed"
+        pc_headline = (
+            f"Partition count spread Δ {counts_spread_pct:.1f}% — broker {max_b_count} leads "
+            f"{int(led.get(max_b_count, 0)):,} partitions vs broker {min_b_count}'s "
+            f"{int(led.get(min_b_count, 0)):,}. Cosmetic unless monitoring shows hot CPU / disk on broker "
+            f"{max_b_count}."
+        )
+    else:
+        pc_status = "heavily-skewed"
+        pc_headline = (
+            f"Partition count spread Δ {counts_spread_pct:.1f}% — broker {max_b_count} leads "
+            f"{int(led.get(max_b_count, 0)):,} partitions vs broker {min_b_count}'s "
+            f"{int(led.get(min_b_count, 0)):,}. Use the Rebalancing Helper to even this out."
+        )
+
+    drivers.append(
+        {
+            "id": "partition_count",
+            "label": "Partition count spread",
+            "status": pc_status,
+            "headline": pc_headline,
+            "table": pc_table,
+            "table_caption": "Partitions led per broker (from describe).",
+        }
+    )
+
+    # ---------- (c) RF=1 topics ----------
+    rf1_pinned: list[tuple[float, str, str, int]] = []
+    rf1_topics_total = 0
+    rf1_pinned_parts = 0
+    for t, row in by_topic.items():
+        if int(row.get("rf") or 0) != 1:
+            continue
+        rf1_topics_total += 1
+        reps = row.get("replicas") or set()
+        if len(reps) == 1:
+            only_b = next(iter(reps))
+            sz = _topic_size_mb_float(topic_sizes, t)
+            prt = int(row.get("parts") or 0)
+            rf1_pinned.append((sz, t, str(only_b), prt))
+            rf1_pinned_parts += prt
+    rf1_pinned.sort(key=lambda x: -x[0])
+
+    rf1_table: list[list[str]] = []
+    rf1_caption = ""
+    if rf1_pinned:
+        rf1_table = [["Topic", "Partitions", "Size", "Pinned to broker"]]
+        for sz, t, b, prt in rf1_pinned[:30]:
+            rf1_table.append([t, str(prt), _fmt_size_mb(sz) if sz > 0 else "N/A", b])
+        rf1_caption = (
+            f"RF=1 topics with all replicas on a single broker — Kafka cannot auto-rebalance these."
+        )
+
+    pinned_pct = (100.0 * rf1_pinned_parts / float(total_parts)) if total_parts > 0 else 0.0
+    if rf1_topics_total == 0:
+        rf1_status = "balanced"
+        rf1_headline = "No RF=1 topics in this cluster — replication is in place everywhere."
+    elif not rf1_pinned:
+        rf1_status = "balanced"
+        rf1_headline = (
+            f"{rf1_topics_total:,} RF=1 topic(s) exist but each spans multiple brokers — Kafka can still "
+            f"reassign leadership."
+        )
+    elif pinned_pct <= 5.0:
+        rf1_status = "mildly-skewed"
+        rf1_headline = (
+            f"{len(rf1_pinned):,} RF=1 topic(s) pinned to single brokers ({rf1_pinned_parts:,} partitions, "
+            f"{pinned_pct:.1f}% of cluster). Manual reassignment needed if you want to rebalance these."
+        )
+    else:
+        rf1_status = "heavily-skewed"
+        rf1_headline = (
+            f"{len(rf1_pinned):,} RF=1 topic(s) pinned to single brokers ({rf1_pinned_parts:,} partitions, "
+            f"{pinned_pct:.1f}% of cluster). This is the main driver of partition-count skew — raise RF ≥ 2 "
+            f"or move them with the Rebalancing Helper."
+        )
+
+    drivers.append(
+        {
+            "id": "rf1",
+            "label": "RF=1 topics",
+            "status": rf1_status,
+            "headline": rf1_headline,
+            "table": rf1_table,
+            "table_caption": rf1_caption,
+        }
+    )
+
+    return {
+        "broker_count": n,
+        "broker_ids": list(broker_ids),
+        "drivers": drivers,
+    }
 
 
 def parse_topic_leader_skew(

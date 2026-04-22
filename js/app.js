@@ -27,13 +27,15 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.27";
+const VERSION = "1.0.28";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
 
 /** @type {{ controller: AbortController | null }} */
 const workloadLogStream = { controller: null };
+/** Auto-refresh timer for workload pod status panel (one active per tab). */
+let workloadPodStatusTimerId = null;
 
 const WL_STACK_COMP = {
   kafka: "kafka",
@@ -102,7 +104,15 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+function clearWorkloadPodStatusTimer() {
+  if (workloadPodStatusTimerId != null) {
+    clearInterval(workloadPodStatusTimerId);
+    workloadPodStatusTimerId = null;
+  }
+}
+
 function stopWorkloadLogStream() {
+  clearWorkloadPodStatusTimer();
   if (workloadLogStream.controller) {
     workloadLogStream.controller.abort();
     workloadLogStream.controller = null;
@@ -188,6 +198,160 @@ function workloadLogsPanelHtml(workload, title) {
         <label class="wrap-chk"><input type="checkbox" class="js-pre-wrap" data-pre-id="${esc(idBase)}-out" checked /> wrap</label>
       </div>
     </section>`;
+}
+
+/**
+ * @param {string} workload kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|cassandra
+ */
+function workloadPodStatusPanelHtml(workload) {
+  const w = esc(workload);
+  return `<section class="panel workload-pod-status" data-wps-workload="${w}">
+  <div class="panel-head">
+    <h2>Pod status</h2>
+    <div class="panel-actions wps-toolbar">
+      <button type="button" class="btn btn-primary" data-wps-refresh>Refresh</button>
+      <label class="field field--inline wps-auto-wrap">
+        <span>Auto-refresh</span>
+        <input type="checkbox" data-wps-auto />
+      </label>
+      <label class="field field--inline">
+        <span>Every (s)</span>
+        <input type="number" class="text text-narrow" data-wps-interval min="5" max="600" value="10" step="1" />
+      </label>
+    </div>
+  </div>
+  <div class="wps-body" data-wps-out><p class="muted">Loading…</p></div>
+  <p class="hint muted" data-wps-meta></p>
+</section>`;
+}
+
+/**
+ * @param {string} phase
+ */
+function workloadPodPhasePillClass(phase) {
+  const p = String(phase || "").toLowerCase();
+  if (p === "running") return "wps-pill wps-pill--ok";
+  if (p === "pending" || p === "unknown") return "wps-pill wps-pill--warn";
+  return "wps-pill wps-pill--bad";
+}
+
+/**
+ * @param {HTMLElement} wrap
+ * @param {unknown} j
+ */
+function renderWorkloadPodStatusPayload(wrap, j) {
+  const out = wrap.querySelector("[data-wps-out]");
+  const meta = wrap.querySelector("[data-wps-meta]");
+  if (!out) return;
+  if (!j || typeof j !== "object" || !j.ok) {
+    out.innerHTML = `<p class="status-bad">${esc((j && j.error) || "failed")}</p>`;
+    if (meta) meta.textContent = "";
+    return;
+  }
+  const pods = Array.isArray(j.pods) ? j.pods : [];
+  if (!pods.length) {
+    out.innerHTML = "<p class='muted'>No matching pods in this namespace.</p>";
+    if (meta) {
+      meta.textContent = `Updated ${String(j.fetched_at || "N/A")} · namespace ${String(j.namespace || "N/A")}`;
+    }
+    return;
+  }
+  const parts = [];
+  for (const p of pods) {
+    const evs = (Array.isArray(p.events) ? p.events : [])
+      .map((e) => {
+        const t = String(e.type || "").toLowerCase();
+        const cls = t === "warning" ? "warn" : "norm";
+        return `<li class="wps-ev wps-ev--${cls}"><strong>${esc(e.reason || "N/A")}</strong> · ${esc(
+          e.age || "N/A",
+        )}<span class="wps-ev-msg">${esc(e.message || "N/A")}</span></li>`;
+      })
+      .join("");
+    const restarts = Number(p.restarts);
+    const rClass = Number.isFinite(restarts) && restarts > 0 ? "wps-val-warn" : "";
+    parts.push(`<article class="wps-card">
+  <header class="wps-card-head"><span class="wps-name">${esc(p.name || "N/A")}</span><span class="${workloadPodPhasePillClass(
+    p.phase,
+  )}">${esc(String(p.phase || "N/A"))}</span></header>
+  <dl class="wps-dl">
+    <div><dt>Ready</dt><dd><strong>${esc(String(p.ready ?? "N/A"))}</strong></dd></div>
+    <div><dt>Restarts</dt><dd class="${rClass}"><strong>${esc(String(p.restarts ?? "N/A"))}</strong></dd></div>
+    <div><dt>Age</dt><dd>${esc(String(p.age ?? "N/A"))}</dd></div>
+    <div><dt>Node</dt><dd><code>${esc(String(p.node ?? "N/A"))}</code></dd></div>
+    <div><dt>Pod CPU</dt><dd>${esc(String(p.cpu ?? "N/A"))}</dd></div>
+    <div><dt>Pod memory</dt><dd>${esc(String(p.memory ?? "N/A"))}</dd></div>
+    <div><dt>Node CPU</dt><dd>${esc(String(p.node_cpu ?? "N/A"))}</dd></div>
+    <div><dt>Node memory</dt><dd>${esc(String(p.node_mem ?? "N/A"))}</dd></div>
+  </dl>
+  <div class="wps-ev-wrap"><h3 class="wps-ev-title">Recent events</h3><ul class="wps-ev-list">${evs || '<li class="muted">N/A</li>'}</ul></div>
+</article>`);
+  }
+  out.innerHTML = `<div class="wps-grid">${parts.join("")}</div>`;
+  const errBits = [];
+  if (j.errors && typeof j.errors === "object") {
+    for (const [k, v] of Object.entries(j.errors)) {
+      if (v) errBits.push(`${k}: ${v}`);
+    }
+  }
+  if (meta) {
+    let m = `Updated ${String(j.fetched_at || "N/A")} · namespace ${String(j.namespace || "N/A")}`;
+    if (errBits.length) m += ` · Partial data: ${errBits.join("; ")}`;
+    meta.textContent = m;
+  }
+}
+
+/**
+ * @param {HTMLElement} root
+ * @param {string} workload
+ */
+function wireWorkloadPodStatus(root, workload) {
+  clearWorkloadPodStatusTimer();
+  const wrap = root.querySelector(`section.workload-pod-status[data-wps-workload="${workload}"]`);
+  if (!wrap) return;
+  const out = wrap.querySelector("[data-wps-out]");
+  const meta = wrap.querySelector("[data-wps-meta]");
+  const btn = wrap.querySelector("[data-wps-refresh]");
+  const auto = wrap.querySelector("[data-wps-auto]");
+  const intervalInp = wrap.querySelector("[data-wps-interval]");
+
+  async function load() {
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const u = new URL("/api/k8s/workload-pod-status", location.origin);
+      u.searchParams.set("workload", workload);
+      const j = await fetchJson(u.toString());
+      renderWorkloadPodStatusPayload(wrap, j);
+    } catch (e) {
+      const d = e.detail || {};
+      out.innerHTML = `<p class="status-bad">${esc(e.message || "failed")}</p>${kafkaPreWithWrapFooter(JSON.stringify(d, null, 2))}`;
+      bindCopyButtons(out);
+      if (meta) meta.textContent = "";
+    }
+  }
+
+  function scheduleAuto() {
+    clearWorkloadPodStatusTimer();
+    if (!auto || !auto.checked) return;
+    let sec = Number.parseInt(String(intervalInp?.value ?? "10"), 10);
+    if (!Number.isFinite(sec) || sec < 5) sec = 5;
+    if (sec > 600) sec = 600;
+    workloadPodStatusTimerId = window.setInterval(() => void load(), sec * 1000);
+  }
+
+  btn?.addEventListener("click", () => void load());
+  auto?.addEventListener("change", () => {
+    clearWorkloadPodStatusTimer();
+    if (auto.checked) scheduleAuto();
+  });
+  intervalInp?.addEventListener("change", () => {
+    if (auto?.checked) {
+      clearWorkloadPodStatusTimer();
+      scheduleAuto();
+    }
+  });
+
+  void load();
 }
 
 /**
@@ -1565,6 +1729,7 @@ function renderClickhouse() {
       <code>clickhouse-client --password</code> (password from <code>data/sensitive/.ch_password</code>).
       Output uses <code>PrettyCompact</code> formatting; default database for unqualified tables is <code>glassbox</code> (<code>GB_STS_CLICKHOUSE_DATABASE</code> on the tool server).
     </p>
+    ${workloadPodStatusPanelHtml("clickhouse")}
     <section class="panel">
       <h2>ClickHouse parameters</h2>
       <div class="ch-toolbar form-grid-wide">
@@ -1752,6 +1917,7 @@ function renderClickhouse() {
     );
     if (ok) runChExec(true);
   });
+  wireWorkloadPodStatus(app, "clickhouse");
   wireWorkloadLogs(app, "clickhouse");
 }
 
@@ -1902,6 +2068,7 @@ function renderSearchEnginePage(engineKey) {
   )}</code> if your chart differs)
       and <code>curl</code> to <code>http://127.0.0.1:9200</code> — same HTTP API style as Elasticsearch; no port-forward.
     </p>
+    ${workloadPodStatusPanelHtml(cfg.stackComp)}
     <section class="panel">
       <h2>${esc(cfg.pageName)} parameters</h2>
       <div class="ch-toolbar form-grid-wide">
@@ -2204,6 +2371,7 @@ function renderSearchEnginePage(engineKey) {
     );
     if (ok) runSearchExec(true);
   });
+  wireWorkloadPodStatus(app, cfg.stackComp);
   wireWorkloadLogs(app, cfg.workloadLogs);
 }
 
@@ -2218,6 +2386,7 @@ function renderKafkaConnect() {
       Uses <code>kubectl exec</code> on <code>glassbox-kafkaconnect-&lt;n&gt;</code> container <code>kafka</code> (override with env <code>GB_STS_KAFKA_CONNECT_CONTAINER</code> if your chart differs)
       and <code>curl</code> to <code>http://127.0.0.1:8083</code> inside the pod.
     </p>
+    ${workloadPodStatusPanelHtml("kafkaconnect")}
     <section class="panel">
       <h2>Kafka Connect parameters</h2>
       <div class="ch-toolbar form-grid-wide">
@@ -2398,6 +2567,7 @@ function renderKafkaConnect() {
     }
   })();
 
+  wireWorkloadPodStatus(app, "kafkaconnect");
   wireWorkloadLogs(app, "kafkaconnect");
 }
 
@@ -2452,6 +2622,7 @@ function renderPostgres() {
       The default kubectl container name is <code>glassbox-postgresql</code>; for stock Bitnami charts use operator env <code>GB_STS_PG_CONTAINER=postgresql</code> when starting the tool server.
       If exec fails with <code>psql: command not found</code>, set <code>GB_STS_PSQL</code> to the in-pod absolute path to <code>psql</code> (often <code>/opt/bitnami/postgresql/bin/psql</code>) and restart <code>server.py</code>.
     </p>
+    ${workloadPodStatusPanelHtml("postgresql")}
     <section class="panel">
       <h2>Pod</h2>
       <p class="muted">Choose the PostgreSQL StatefulSet pod (stack probe lists non-HA and HA chart names).</p>
@@ -2748,6 +2919,7 @@ function renderPostgres() {
     );
     if (ok) void runPgExec(true);
   });
+  wireWorkloadPodStatus(app, "postgresql");
   wireWorkloadLogs(app, "postgresql");
 }
 
@@ -2765,6 +2937,7 @@ function renderCassandra() {
       If your image stores it elsewhere, set operator env <code>GB_STS_CQLSH</code> to the <strong>in-pod</strong> absolute path before starting <code>server.py</code>.
       CQL target uses <code>GB_STS_CASSANDRA_CQL_HOST</code> if set, else chart env <code>CASSANDRA_HOST</code> / <code>POD_IP</code> / <code>CASSANDRA_BROADCAST_ADDRESS</code>, else <code>127.0.0.1</code>. Port: <code>GB_STS_CASSANDRA_CQL_PORT</code> or <code>CASSANDRA_CQL_PORT_NUMBER</code> or <code>9042</code>.
     </p>
+    ${workloadPodStatusPanelHtml("cassandra")}
     <section class="panel">
       <h2>Pod</h2>
       <label class="field">
@@ -3024,6 +3197,7 @@ function renderCassandra() {
     );
     if (ok) void runCassExec(true);
   });
+  wireWorkloadPodStatus(app, "cassandra");
   wireWorkloadLogs(app, "cassandra");
 }
 
@@ -3035,6 +3209,7 @@ function renderKafka() {
   }
   app.innerHTML = `
     <p class="muted">Pod <code>glassbox-kafka-0</code> — commands run in the <code>kafka</code> container with a random high <code>JMX_PORT</code> per request to avoid port collisions.</p>
+    ${workloadPodStatusPanelHtml("kafka")}
 
     <section class="kafka-subject" aria-labelledby="kafka-subject-brokers">
       <h2 class="kafka-subject-title" id="kafka-subject-brokers">Brokers</h2>
@@ -3373,6 +3548,7 @@ ${preWithCopy(c3)}`;
   wireKafkaRows(gridTopics, topicPanels);
   wireKafkaRows(gridGroups, [...groupPanelsLeft, ...groupPanelsRight, ...groupPanelsLag]);
 
+  wireWorkloadPodStatus(app, "kafka");
   wireWorkloadLogs(app, "kafka");
 
   const execWrap = app.querySelector("#exec-out-wrap");

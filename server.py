@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.27"
+VERSION = "1.0.28"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -39,6 +39,7 @@ from backend import sensitive_store as sens  # noqa: E402
 from backend import session as sess  # noqa: E402
 from backend import pg_cassandra as pgc  # noqa: E402
 from backend import stack_components as stack  # noqa: E402
+from backend import workload_pod_status as podstat  # noqa: E402
 
 _httpd: ThreadingHTTPServer | None = None
 
@@ -862,6 +863,18 @@ class Handler(SimpleHTTPRequestHandler):
             cl = _cloud_from_session(s)
             ap = _aws_profile_from_session(s)
             self._json(stack.probe_stack_in_namespace(ns, aws_profile=ap, cloud=cl))
+            return
+
+        if path == "/api/k8s/workload-pod-status":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            wl = (qs.get("workload") or [""])[0].strip().lower()
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            self._json(podstat.fetch_workload_pod_status(ns, wl, aws_profile=ap, cloud=cl))
             return
 
         if path == "/api/clickhouse/panel":

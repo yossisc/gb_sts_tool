@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.27",
+    "app_version": "1.0.28",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",
@@ -39,6 +39,7 @@
       { "method": "POST", "path": "/api/k8s/verify", "body": "{ connect?, cluster_name?, namespace?, aws_profile?, cloud?, region? }", "effect": "Optional aws eks update-kubeconfig / az aks get-credentials; then cluster-info; writes data/sensitive/last_connected.json" },
       { "method": "POST", "path": "/api/session/clear", "effect": "Clear session cookie" },
       { "method": "GET", "path": "/api/k8s/stack", "auth": "session", "notes": "Pod replica counts per known Glassbox component in session namespace" },
+      { "method": "GET", "path": "/api/k8s/workload-pod-status", "query": "workload=kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|cassandra", "auth": "session", "notes": "Batched pod status: get pods JSON + top pod + top node + events (filtered); used by workload pages" },
       { "method": "GET", "path": "/api/kafka/panel", "query": "panel=&group=&topic=&topics_min=&topics_substring=", "auth": "session cookie required", "notes": "topics_min / topics_substring apply to panel topics_partition_counts only" },
       { "method": "POST", "path": "/api/kafka/rebalance/analyze", "body": "{}", "auth": "session", "notes": "kubectl exec kafka pod: du -sk /bitnami/kafka/data/*; response table is per-topic total MB (sorted desc) + default_num_brokers (read-only)" },
       { "method": "POST", "path": "/api/kafka/exec", "body": "{ command, confirmed? }", "auth": "session cookie required", "notes": "409 + needs_confirmation when risky and confirmed false" },

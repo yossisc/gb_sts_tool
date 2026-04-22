@@ -4,7 +4,7 @@
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
-    "app_version": "1.0.28",
+    "app_version": "1.0.31",
     "runtime": {
       "entrypoint": "server.py",
       "launcher": "run",
@@ -53,7 +53,7 @@
       { "method": "GET", "path": "/api/k8s/logs/stream", "query": "workload=kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|cassandra&pod=&container=", "auth": "session", "notes": "SSE text/event-stream; workload-specific pod/container allowlist" },
       { "method": "GET", "path": "/api/postgres/panel", "query": "panel=databases|schemas|tables&schema=&pg_pod=", "auth": "session", "notes": "Fixed SELECT via psql; requires .pg_password; psql path via GB_STS_PSQL if not on PATH" },
       { "method": "POST", "path": "/api/postgres/exec", "body": "{ sql, pg_pod, confirmed? }", "auth": "session", "notes": "409 when SQL not read-only and confirmed false" },
-      { "method": "GET", "path": "/api/cassandra/panel", "query": "panel=keyspaces|desc_keyspace|tables&cass_pod=&keyspace=", "auth": "session", "notes": "Fixed read-only CQL via cqlsh" },
+      { "method": "GET", "path": "/api/cassandra/panel", "query": "panel=keyspaces|desc_keyspace|tables&cass_pod=&keyspace=", "auth": "session", "notes": "Fixed read-only CQL via cqlsh; panel=keyspaces returns table (Keyspace name column) plus stdout" },
       { "method": "POST", "path": "/api/cassandra/exec", "body": "{ cql, cass_pod, confirmed? }", "auth": "session", "notes": "409 when CQL not read-only and confirmed false" }
     ]
   },

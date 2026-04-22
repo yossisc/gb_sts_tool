@@ -235,6 +235,86 @@ def aggregate_du_kafka_data_by_topic(stdout: str) -> list[list[str]]:
     return [["Topic", "Size (MB)"]] + [[t, f"{kb / 1024.0:.2f}"] for t, kb in rows_sorted]
 
 
+def parse_topic_leader_skew(
+    describe_stdout: str,
+    *,
+    topic_sizes_mb: dict[str, str] | None = None,
+    min_partitions: int = 2,
+    limit: int = 40,
+) -> list[list[str]]:
+    """
+    Parse ``kafka-topics.sh --describe`` output and highlight topics where leaders are unevenly spread.
+    Returns ``[]`` when no skew rows found; otherwise header + rows:
+    Topic, Partitions, Max leader/broker, Min leader/broker, Delta, Delta %, Size (MB)
+    """
+    topic_sizes = topic_sizes_mb or {}
+    agg: dict[str, dict[str, Any]] = {}
+    for raw in (describe_stdout or "").splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        m = _PART_LINE_RE.search(ln)
+        if not m:
+            continue
+        topic = m.group("topic")
+        leader = m.group("leader")
+        replicas = m.group("replicas")
+        if not topic:
+            continue
+        row = agg.setdefault(topic, {"parts": 0, "leader_counts": {}, "replicas": set()})
+        row["parts"] += 1
+        if re.fullmatch(r"\d+", leader):
+            lc = row["leader_counts"]
+            lc[leader] = lc.get(leader, 0) + 1
+        for b in replicas.split(","):
+            bid = b.strip()
+            if re.fullmatch(r"\d+", bid):
+                row["replicas"].add(bid)
+
+    out_rows: list[list[str]] = []
+    for topic, row in agg.items():
+        parts = int(row.get("parts") or 0)
+        if parts < min_partitions:
+            continue
+        leaders: dict[str, int] = row.get("leader_counts") or {}
+        broker_ids = row.get("replicas") or set(leaders.keys())
+        if not broker_ids:
+            continue
+        counts = [int(leaders.get(b, 0)) for b in sorted(broker_ids, key=int)]
+        if not counts:
+            continue
+        mx = max(counts)
+        mn = min(counts)
+        delta = mx - mn
+        if delta <= 0:
+            continue
+        pct = (float(delta) * 100.0 / float(parts)) if parts > 0 else 0.0
+        out_rows.append(
+            [
+                topic,
+                str(parts),
+                str(mx),
+                str(mn),
+                str(delta),
+                f"{pct:.1f}",
+                str(topic_sizes.get(topic, "N/A")),
+            ]
+        )
+
+    out_rows.sort(
+        key=lambda r: (
+            -int(r[4]),
+            -int(r[1]),
+            -float(r[6]) if re.fullmatch(r"\d+(\.\d+)?", r[6]) else 0.0,
+            r[0].casefold(),
+        )
+    )
+    if not out_rows:
+        return []
+    hdr = ["Topic", "Partitions", "Max leader/broker", "Min leader/broker", "Delta", "Delta %", "Size (MB)"]
+    return [hdr] + out_rows[: max(1, int(limit))]
+
+
 def filter_topic_partition_rows(
     rows: list[list[str]],
     *,

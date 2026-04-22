@@ -125,7 +125,42 @@ def classify_cassandra_cql(cql: str) -> tuple[bool, str]:
 
 
 def cassandra_keyspaces_cql() -> str:
-    return "DESCRIBE KEYSPACES;"
+    # Tabular cqlsh output; no ORDER BY — system_schema.keyspaces is not ordered by cluster key without a partition filter.
+    return "SELECT keyspace_name FROM system_schema.keyspaces;"
+
+
+_KEYSPACE_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def parse_cassandra_keyspaces_cqlsh_stdout(stdout: str) -> list[str]:
+    """Extract keyspace names from typical cqlsh ASCII or pipe-separated result rows."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in (stdout or "").splitlines():
+        raw = line.rstrip()
+        s = raw.strip()
+        if not s:
+            continue
+        # Table borders / separators
+        if re.match(r"^[+|][-+|]*[+|]?$", s) or re.match(r"^[-+|][-+| ]*$", s):
+            continue
+        if "rows)" in s.lower() and s.strip().startswith("("):
+            continue
+        if "|" in raw:
+            parts = [p.strip() for p in raw.split("|")]
+            cell = parts[0] if parts else ""
+        else:
+            cell = s
+        low = cell.lower()
+        if low in ("keyspace_name", "name"):
+            continue
+        if not _KEYSPACE_IDENT.match(cell):
+            continue
+        if cell not in seen:
+            seen.add(cell)
+            names.append(cell)
+    names.sort(key=str.lower)
+    return names
 
 
 def cassandra_desc_keyspace_cql(keyspace: str) -> str:

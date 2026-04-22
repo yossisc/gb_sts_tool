@@ -27,7 +27,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "1.0.28";
+const VERSION = "1.0.31";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -46,6 +46,17 @@ const WL_STACK_COMP = {
   postgresql: "postgresql",
   cassandra: "cassandra",
 };
+
+/** Route prefix -> stack component id */
+const WORKLOAD_ROUTE_TO_COMP = [
+  ["#/kafka-connect", "kafkaconnect"],
+  ["#/kafka", "kafka"],
+  ["#/elasticsearch", "elasticsearch"],
+  ["#/opensearch", "opensearch"],
+  ["#/clickhouse", "clickhouse"],
+  ["#/postgres", "postgresql"],
+  ["#/cassandra", "cassandra"],
+];
 
 const WL_DEFAULT_POD = {
   kafka: "glassbox-kafka-0",
@@ -282,6 +293,9 @@ function renderWorkloadPodStatusPayload(wrap, j) {
     <div><dt>Pod memory</dt><dd>${esc(String(p.memory ?? "N/A"))}</dd></div>
     <div><dt>Node CPU</dt><dd>${esc(String(p.node_cpu ?? "N/A"))}</dd></div>
     <div><dt>Node memory</dt><dd>${esc(String(p.node_mem ?? "N/A"))}</dd></div>
+    <div><dt>Disk size</dt><dd>${esc(String(p.storage_size ?? "N/A"))}</dd></div>
+    <div><dt>Disk used</dt><dd>${esc(String(p.storage_used ?? "N/A"))}</dd></div>
+    <div><dt>Disk free</dt><dd>${esc(String(p.storage_free ?? "N/A"))}</dd></div>
   </dl>
   <div class="wps-ev-wrap"><h3 class="wps-ev-title">Recent events</h3><ul class="wps-ev-list">${evs || '<li class="muted">N/A</li>'}</ul></div>
 </article>`);
@@ -314,15 +328,26 @@ function wireWorkloadPodStatus(root, workload) {
   const auto = wrap.querySelector("[data-wps-auto]");
   const intervalInp = wrap.querySelector("[data-wps-interval]");
 
-  async function load() {
+  /**
+   * @param {{ preserveDisplay?: boolean }} [opts]
+   * When preserveDisplay is true (Refresh / auto-refresh), keep showing the previous pod cards until new JSON arrives.
+   */
+  async function load(opts = {}) {
+    const preserve = !!opts.preserveDisplay;
     if (!out) return;
-    out.innerHTML = "<p class='muted'>Loading…</p>";
+    if (!preserve) {
+      out.innerHTML = "<p class='muted'>Loading…</p>";
+    }
     try {
       const u = new URL("/api/k8s/workload-pod-status", location.origin);
       u.searchParams.set("workload", workload);
       const j = await fetchJson(u.toString());
       renderWorkloadPodStatusPayload(wrap, j);
     } catch (e) {
+      if (preserve && out.querySelector(".wps-grid, .wps-card")) {
+        if (meta) meta.textContent = `Refresh failed: ${String(e.message || "failed")}`;
+        return;
+      }
       const d = e.detail || {};
       out.innerHTML = `<p class="status-bad">${esc(e.message || "failed")}</p>${kafkaPreWithWrapFooter(JSON.stringify(d, null, 2))}`;
       bindCopyButtons(out);
@@ -336,10 +361,10 @@ function wireWorkloadPodStatus(root, workload) {
     let sec = Number.parseInt(String(intervalInp?.value ?? "10"), 10);
     if (!Number.isFinite(sec) || sec < 5) sec = 5;
     if (sec > 600) sec = 600;
-    workloadPodStatusTimerId = window.setInterval(() => void load(), sec * 1000);
+    workloadPodStatusTimerId = window.setInterval(() => void load({ preserveDisplay: true }), sec * 1000);
   }
 
-  btn?.addEventListener("click", () => void load());
+  btn?.addEventListener("click", () => void load({ preserveDisplay: true }));
   auto?.addEventListener("change", () => {
     clearWorkloadPodStatusTimer();
     if (auto.checked) scheduleAuto();
@@ -351,7 +376,7 @@ function wireWorkloadPodStatus(root, workload) {
     }
   });
 
-  void load();
+  void load({ preserveDisplay: false });
 }
 
 /**
@@ -678,11 +703,13 @@ function applyWorkloadNavAvailability(st) {
     }
     const disabled = known && rep <= 0;
     if (disabled) {
+      el.hidden = true;
       el.classList.add("nav-disabled");
       el.setAttribute("aria-disabled", "true");
       el.setAttribute("tabindex", "-1");
       el.title = "No pods for this workload in the connected namespace.";
     } else {
+      el.hidden = false;
       el.classList.remove("nav-disabled");
       el.removeAttribute("aria-disabled");
       el.removeAttribute("tabindex");
@@ -694,6 +721,7 @@ function applyWorkloadNavAvailability(st) {
 function clearWorkloadNavDisabledState() {
   for (const [el] of WORKLOAD_NAV_STACK_KEYS) {
     if (!el) continue;
+    el.hidden = false;
     el.classList.remove("nav-disabled");
     el.removeAttribute("aria-disabled");
     el.removeAttribute("tabindex");
@@ -724,6 +752,25 @@ function isCurrentHashWorkloadDisabled() {
     }
   }
   return false;
+}
+
+/**
+ * Uses cached stack probe to decide if hash route is currently available.
+ * Returns true when stack cache is unknown to avoid accidental false blocking.
+ * @param {string} hash
+ * @returns {boolean}
+ */
+function isWorkloadRouteAvailable(hash) {
+  const st = stackFromSessionStorage();
+  const known = !!(st && st.ok === true && st.components && typeof st.components === "object");
+  if (!known) return true;
+  for (const [prefix, comp] of WORKLOAD_ROUTE_TO_COMP) {
+    if (!hashMatchesRoute(hash, prefix)) continue;
+    const e = /** @type {Record<string, unknown>} */ (st.components)[comp];
+    const rep = e && typeof e === "object" && typeof e.replicas === "number" && Number.isFinite(e.replicas) ? e.replicas : 0;
+    return rep > 0;
+  }
+  return true;
 }
 
 async function refreshK8sStrip() {
@@ -758,6 +805,22 @@ async function refreshSessionUi() {
     sessionVerified = !!s.verified;
     workloadLogContainers = s.workload_log_containers && typeof s.workload_log_containers === "object" ? s.workload_log_containers : null;
     if (sessionVerified && s.session) {
+      try {
+        const fp = JSON.stringify({
+          n: s.session.n || "",
+          c: s.session.c || "",
+          d: s.session.d || "",
+          r: s.session.r || "",
+          p: s.session.p || "",
+        });
+        const prev = sessionStorage.getItem("gb_sts_session_fp");
+        if (prev !== fp) {
+          sessionStorage.removeItem("gb_sts_stack");
+          sessionStorage.setItem("gb_sts_session_fp", fp);
+        }
+      } catch {
+        /* ignore */
+      }
       navKafka.hidden = false;
       if (navKafkaConnect) navKafkaConnect.hidden = false;
       if (navClickhouse) navClickhouse.hidden = false;
@@ -811,13 +874,18 @@ function setActiveNav() {
   });
 }
 
-/** @param {{ index: number, variant: "topic" | "group" | "es_index" }} pick */
+/** @param {{ index: number, variant: "topic" | "group" | "es_index" | "cassandra_keyspace" }} pick */
 function kafkaPickCellInner(cell, ci, pick) {
   if (!pick || pick.index !== ci) return esc(cell == null ? "" : String(cell));
   const enc = encodeURIComponent(String(cell ?? ""));
   if (pick.variant === "es_index") {
     return `<button type="button" class="cell-link js-es-pick-index" data-name="${enc}" title="${esc(
       "Use this value as the index pattern",
+    )}">${esc(cell == null ? "" : String(cell))}</button>`;
+  }
+  if (pick.variant === "cassandra_keyspace") {
+    return `<button type="button" class="cell-link js-cass-pick-keyspace" data-name="${enc}" title="${esc(
+      "Fill keyspace name fields (Describe / Tables)",
     )}">${esc(cell == null ? "" : String(cell))}</button>`;
   }
   const cls = pick.variant === "group" ? "js-kafka-pick-group" : "js-kafka-pick-topic";
@@ -832,8 +900,13 @@ function kafkaDataRowHtml(cells, table) {
   const pickCol = table.getAttribute("data-pick-col");
   const pickVar = table.getAttribute("data-pick-variant");
   const pick =
-    pickCol != null && pickCol !== "" && (pickVar === "topic" || pickVar === "group" || pickVar === "es_index")
-      ? { index: Number.parseInt(pickCol, 10), variant: /** @type {"topic"|"group"|"es_index"} */ (pickVar) }
+    pickCol != null &&
+    pickCol !== "" &&
+    (pickVar === "topic" || pickVar === "group" || pickVar === "es_index" || pickVar === "cassandra_keyspace")
+      ? {
+          index: Number.parseInt(pickCol, 10),
+          variant: /** @type {"topic"|"group"|"es_index"|"cassandra_keyspace"} */ (pickVar),
+        }
       : null;
   return `<tr>${cells
     .map((c, ci) => {
@@ -1062,6 +1135,16 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
         inner += renderTable(j.table, { theadFirstRow: true });
       }
     }
+    if (panelId === "leader_balance" && j.leader_skew_table && j.leader_skew_table.length > 1) {
+      inner += `<p class="hint">Topic leadership skew (higher delta indicates less-even broker spread; use size to judge impact)</p>`;
+      inner += kafkaTopicDataTableScroll(
+        renderTable(j.leader_skew_table, {
+          theadFirstRow: true,
+          sortableColumnIndexes: [1, 2, 3, 4, 5, 6],
+          tableClass: "kafka-lag-table",
+        }),
+      );
+    }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
     inner += kafkaPreWithWrapFooter(blobOut, {
       wrapChecked:
@@ -1080,7 +1163,7 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
     }
     if (panelId === "topics_partition_counts") {
       wireTopicsPartitionSort(elOut);
-    } else if (panelId === "topic_describe") {
+    } else if (panelId === "topic_describe" || panelId === "leader_balance") {
       const wrap = elOut.querySelector(".kafka-topic-table-scroll");
       if (wrap) wireKafkaTableHeaderSort(wrap);
     } else if (panelId === "consumer_groups_list") {
@@ -1090,7 +1173,14 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
   } catch (e) {
     const d = e.detail || {};
     const blob = JSON.stringify(d, null, 2);
-    elOut.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${kafkaPreWithWrapFooter(blob)}`;
+    let extraHint = "";
+    const dmsg = `${String(d.error || "")} ${String(d.detail || "")}`.trim();
+    if (/not found/i.test(String(e.message || "")) || /not found/i.test(dmsg)) {
+      extraHint =
+        "<p class='hint'>This workload appears missing in the connected namespace. Menus will refresh from stack probe shortly.</p>";
+      void refreshSessionUi();
+    }
+    elOut.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${extraHint}${kafkaPreWithWrapFooter(blob)}`;
     bindCopyButtons(elOut);
     return false;
   }
@@ -2945,10 +3035,11 @@ function renderCassandra() {
         <select class="text" id="cass-pod-select"></select>
       </label>
     </section>
-    <section class="panel">
+    <section class="panel" id="cass-keyspaces-panel">
       <h2>Keyspaces</h2>
+      <p class="hint" style="margin-top:0;">Runs <code>SELECT keyspace_name FROM system_schema.keyspaces</code> (read-only). Click a keyspace in the table to fill the fields below.</p>
       <button type="button" class="btn btn-primary" id="cass-keyspaces-refresh">Refresh</button>
-      <div id="cass-keyspaces-out" style="margin-top:0.75rem;"><p class="muted">Click Refresh for <code>DESCRIBE KEYSPACES</code>.</p></div>
+      <div id="cass-keyspaces-out" style="margin-top:0.75rem;"><p class="muted">Loading…</p></div>
     </section>
     <section class="panel">
       <h2>Describe keyspace</h2>
@@ -3005,6 +3096,15 @@ function renderCassandra() {
   }
 
   (async () => {
+    const sel = document.getElementById("cass-pod-select");
+    if (!sel) return;
+    sel.innerHTML = "";
+    {
+      const o = document.createElement("option");
+      o.value = "glassbox-cassandra-0";
+      o.textContent = "glassbox-cassandra-0";
+      sel.appendChild(o);
+    }
     let stack = null;
     try {
       stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
@@ -3018,8 +3118,6 @@ function renderCassandra() {
         stack = null;
       }
     }
-    const sel = document.getElementById("cass-pod-select");
-    if (!sel) return;
     const pods = stack?.components?.cassandra?.pods;
     sel.innerHTML = "";
     if (Array.isArray(pods) && pods.length) {
@@ -3035,6 +3133,7 @@ function renderCassandra() {
       o.textContent = "glassbox-cassandra-0";
       sel.appendChild(o);
     }
+    await refreshCassKeyspaces();
   })();
 
   renderCassHistoryUi();
@@ -3064,25 +3163,71 @@ function renderCassandra() {
     return fetchJson(u.toString());
   }
 
-  document.getElementById("cass-keyspaces-refresh")?.addEventListener("click", async () => {
+  /**
+   * @param {unknown} j
+   */
+  function renderCassKeyspacesOut(j) {
+    const out = document.getElementById("cass-keyspaces-out");
+    if (!out) return;
+    if (!j || typeof j !== "object" || !j.ok) {
+      const err = /** @type {{ error?: string, stderr?: string, stdout?: string }} */ (j || {});
+      out.innerHTML = `<p class="status-bad">${esc(err.error || err.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+        [err.stdout, err.stderr].filter(Boolean).join("\n"),
+      )}`;
+      bindCopyButtons(out);
+      return;
+    }
+    let inner = `<p class='hint'>${esc(String(/** @type {{ cql_executed?: string }} */ (j).cql_executed || ""))}</p>`;
+    const table = /** @type {{ table?: string[][] }} */ (j).table;
+    if (Array.isArray(table) && table.length > 1) {
+      inner += kafkaTopicDataTableScroll(
+        renderTable(table, {
+          theadFirstRow: true,
+          tableClass: "es-cat-table",
+          pickColumn: { index: 0, variant: "cassandra_keyspace" },
+          stringSortableColumnIndexes: [0],
+        }),
+      );
+    } else if (Array.isArray(table) && table.length === 1) {
+      inner += "<p class='muted'>(no keyspaces found)</p>";
+    }
+    const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+    inner += kafkaPreWithWrapFooter(blob);
+    out.innerHTML = inner;
+    bindCopyButtons(out);
+    const wrap = out.querySelector(".kafka-topic-table-scroll");
+    if (wrap) wireKafkaTableHeaderSort(wrap);
+  }
+
+  async function refreshCassKeyspaces() {
     const out = document.getElementById("cass-keyspaces-out");
     if (!out) return;
     out.innerHTML = "<p class='muted'>Loading…</p>";
     try {
       const j = await loadCassPanel("keyspaces");
-      if (!j.ok) {
-        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
-          [j.stdout, j.stderr].filter(Boolean).join("\n"),
-        )}`;
-        bindCopyButtons(out);
-        return;
-      }
-      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
-      out.innerHTML = `<p class='hint'>${esc(String(j.cql_executed || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
-      bindCopyButtons(out);
+      renderCassKeyspacesOut(j);
     } catch (e) {
       out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
     }
+  }
+
+  document.getElementById("cass-keyspaces-refresh")?.addEventListener("click", () => void refreshCassKeyspaces());
+
+  document.getElementById("cass-keyspaces-panel")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-cass-pick-keyspace");
+    if (!b) return;
+    const enc = b.getAttribute("data-name");
+    if (enc == null) return;
+    let name = "";
+    try {
+      name = decodeURIComponent(enc);
+    } catch {
+      return;
+    }
+    const d = document.getElementById("cass-desc-ks");
+    const t = document.getElementById("cass-tables-ks");
+    if (d) d.value = name;
+    if (t) t.value = name;
   });
 
   document.getElementById("cass-desc-refresh")?.addEventListener("click", async () => {
@@ -3619,7 +3764,7 @@ ${preWithCopy(c3)}`;
 
 function route() {
   stopWorkloadLogStream();
-  if (isCurrentHashWorkloadDisabled()) {
+  if (isCurrentHashWorkloadDisabled() || !isWorkloadRouteAvailable(location.hash || "#/")) {
     location.hash = "#/";
     return;
   }

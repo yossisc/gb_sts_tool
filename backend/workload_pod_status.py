@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,16 @@ from backend import stack_components as stack
 _ALLOWED_WORKLOADS = frozenset(
     {"kafka", "kafkaconnect", "clickhouse", "elasticsearch", "opensearch", "postgresql", "cassandra"}
 )
+
+_WORKLOAD_DISK_PATH: dict[str, str | None] = {
+    "kafka": "/bitnami/kafka",
+    "kafkaconnect": None,
+    "elasticsearch": "/bitnami/elasticsearch/data",
+    "opensearch": "/bitnami/opensearch/data",
+    "clickhouse": "/var/lib/clickhouse",
+    "postgresql": "/bitnami/postgresql",
+    "cassandra": "/bitnami/cassandra",
+}
 
 
 def _prefixes_for_workload(workload: str) -> list[str]:
@@ -159,6 +170,34 @@ def _collect_events_for_pods(
     return by_pod
 
 
+def _parse_df_batch(stdout: str, pod_names: set[str]) -> dict[str, dict[str, str]]:
+    """
+    Parse helper output from one batched subprocess that loops kubectl exec + ``df -h`` over pods.
+    Expected marker lines: ``__GB_POD__ <name>`` and data lines: ``SIZE|USED|FREE``.
+    """
+    out: dict[str, dict[str, str]] = {p: {"size": "N/A", "used": "N/A", "free": "N/A"} for p in pod_names}
+    current = ""
+    for raw in (stdout or "").splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        if ln.startswith("__GB_POD__ "):
+            current = ln.split("__GB_POD__ ", 1)[1].strip()
+            if current not in out:
+                out[current] = {"size": "N/A", "used": "N/A", "free": "N/A"}
+            continue
+        if not current:
+            continue
+        if "|" not in ln:
+            continue
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) < 3:
+            continue
+        out[current] = {"size": parts[0] or "N/A", "used": parts[1] or "N/A", "free": parts[2] or "N/A"}
+        current = ""
+    return out
+
+
 def fetch_workload_pod_status(
     namespace: str,
     workload: str,
@@ -252,6 +291,27 @@ def fetch_workload_pod_status(
     else:
         errors["events"] = kx.filter_kubectl_noise(r_ev.stderr) or "kubectl get events failed"
 
+    disk_by_pod: dict[str, dict[str, str]] = {n: {"size": "N/A", "used": "N/A", "free": "N/A"} for n in pod_names}
+    disk_path = _WORKLOAD_DISK_PATH.get(w)
+    if disk_path and pod_names:
+        pods_list = sorted(pod_names)
+        pod_tokens = " ".join(shlex.quote(p) for p in pods_list)
+        nsq = shlex.quote(namespace)
+        pathq = shlex.quote(disk_path)
+        script = (
+            "for p in "
+            + pod_tokens
+            + "; do "
+            + 'printf "__GB_POD__ %s\\n" "$p"; '
+            + f'kubectl exec -n {nsq} "$p" -- sh -lc "df -h {pathq} 2>/dev/null | awk \'NR==2{{print \\$2\"|\"\\$3\"|\"\\$4}}\'" 2>/dev/null || true; '
+            + "done"
+        )
+        r_df = kx._run(["bash", "-lc", script], timeout=80, aws_profile=aws_profile, cloud=cloud)
+        if r_df.ok:
+            disk_by_pod = _parse_df_batch(r_df.stdout or "", pod_names)
+        else:
+            errors["storage"] = kx.filter_kubectl_noise(r_df.stderr) or "kubectl exec df scan failed"
+
     pods_out: list[dict[str, Any]] = []
     for item in matched:
         meta = item.get("metadata") or {}
@@ -286,6 +346,9 @@ def fetch_workload_pod_status(
                 "memory": mem,
                 "node_cpu": node_cpu,
                 "node_mem": node_mem,
+                "storage_size": disk_by_pod.get(name, {}).get("size", "N/A"),
+                "storage_used": disk_by_pod.get(name, {}).get("used", "N/A"),
+                "storage_free": disk_by_pod.get(name, {}).get("free", "N/A"),
                 "events": events_by_pod.get(name, []),
             }
         )

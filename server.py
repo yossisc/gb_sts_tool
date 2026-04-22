@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "1.0.28"
+VERSION = "1.0.31"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -277,6 +277,9 @@ rm -f "$D"
     if panel == "leader_balance":
         inner = f"""D=$(mktemp)
 {kb}/kafka-topics.sh --describe --bootstrap-server {bs} >"$D" 2>&1 || true
+echo '---GB_STS_LEADER_DESCRIBE---'
+cat "$D"
+echo '---GB_STS_LEADER_COUNTS---'
 IDS=$(grep 'Leader:' "$D" 2>/dev/null | sed -n 's/.*Leader: \\([0-9]*\\).*/\\1/p' | sort -u)
 for i in $IDS; do
   c=$(grep -c "Leader: $i" "$D" 2>/dev/null || echo 0)
@@ -1087,18 +1090,20 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
                 return
             r = kx.cassandra_cqlsh_query(ns, pod_name, kx.CASSANDRA_CONTAINER, cql, timeout=120, aws_profile=ap, cloud=cl)
-            self._json(
-                {
-                    "ok": r.ok,
-                    "panel": panel,
-                    "stdout": kx.tail_lines(r.stdout, 8000),
-                    "stderr": kx.filter_kubectl_noise(r.stderr),
-                    "returncode": r.returncode,
-                    "cmd_display": r.cmd_display,
-                    "pod": pod_name,
-                    "cql_executed": cql,
-                }
-            )
+            out_payload: dict = {
+                "ok": r.ok,
+                "panel": panel,
+                "stdout": kx.tail_lines(r.stdout, 8000),
+                "stderr": kx.filter_kubectl_noise(r.stderr),
+                "returncode": r.returncode,
+                "cmd_display": r.cmd_display,
+                "pod": pod_name,
+                "cql_executed": cql,
+            }
+            if panel == "keyspaces" and r.ok:
+                ks_names = pgc.parse_cassandra_keyspaces_cqlsh_stdout(r.stdout)
+                out_payload["table"] = [["Keyspace name"]] + [[n] for n in ks_names]
+            self._json(out_payload)
             return
 
         if path == "/api/kafka/panel":
@@ -1142,12 +1147,41 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 out["table"] = [["Partitions (×)", "Topic"]] + filtered
             elif panel == "leader_balance":
+                raw = r.stdout or ""
+                describe_part = raw
+                counts_part = raw
+                mark_desc = "---GB_STS_LEADER_DESCRIBE---"
+                mark_counts = "---GB_STS_LEADER_COUNTS---"
+                if mark_desc in raw and mark_counts in raw:
+                    _pre, rest = raw.split(mark_desc, 1)
+                    describe_part, counts_part = rest.split(mark_counts, 1)
                 rows = []
-                for line in r.stdout.splitlines():
+                for line in counts_part.splitlines():
                     m = re.match(r"broker\s+(\d+)\s+(\d+)", line.strip())
                     if m and int(m.group(2)) > 0:
                         rows.append([m.group(1), m.group(2)])
                 out["table"] = [["Broker id", "Partitions led"]] + rows
+                # Add topic-level skew + size context to judge if broker deltas are meaningful.
+                r_du = kx.kafka_bash_exec(
+                    ns,
+                    "du -sk /bitnami/kafka/data/* 2>/dev/null | sort -rn | head -n 600",
+                    timeout=220,
+                    aws_profile=ap,
+                    cloud=cl,
+                )
+                if r_du.ok:
+                    by_topic = kparse.aggregate_du_kafka_data_by_topic(r_du.stdout or "")
+                    size_mb: dict[str, str] = {}
+                    if len(by_topic) > 1:
+                        for rr in by_topic[1:]:
+                            if len(rr) >= 2:
+                                size_mb[str(rr[0])] = str(rr[1])
+                    skew_tbl = kparse.parse_topic_leader_skew(describe_part or "", topic_sizes_mb=size_mb)
+                    if skew_tbl:
+                        out["leader_skew_table"] = skew_tbl
+                else:
+                    out.setdefault("errors", {})
+                    out["errors"]["leader_balance_sizes"] = kx.filter_kubectl_noise(r_du.stderr) or "du scan failed"
             elif panel == "consumer_groups_list":
                 list_body, desc_body = kparse.consumer_groups_list_split_panel_stdout(r.stdout or "")
                 names = kparse.parse_consumer_group_names(list_body)

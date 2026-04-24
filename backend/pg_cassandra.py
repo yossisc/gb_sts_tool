@@ -176,3 +176,70 @@ def cassandra_desc_keyspace_cql(keyspace: str) -> str:
 def cassandra_tables_cql(keyspace: str) -> str:
     ks = sanitize_cassandra_keyspace(keyspace)
     return "SELECT table_name FROM system_schema.tables " f"WHERE keyspace_name = '{ks}';"
+
+
+def sanitize_cassandra_table(name: str) -> str:
+    """Table / column family identifier (same conservative rules as keyspace names)."""
+    n = (name or "").strip()
+    if not n:
+        raise ValueError("table name is required")
+    if not _CASS_KEYSPACE.match(n):
+        raise ValueError("invalid table name")
+    return n
+
+
+def _cqlsh_row_cells(line: str) -> list[str]:
+    parts = [p.strip() for p in line.split("|")]
+    while parts and parts[0] == "":
+        parts.pop(0)
+    while parts and parts[-1] == "":
+        parts.pop()
+    return [p for p in parts if p != ""]
+
+
+def parse_cassandra_tables_cqlsh_stdout(stdout: str) -> list[str]:
+    """Extract ``table_name`` cells from cqlsh output (handles bordered tables)."""
+    raw_lines = [ln.rstrip() for ln in (stdout or "").splitlines()]
+    col_idx = 0
+    for line in raw_lines:
+        s = line.strip()
+        if "|" not in s or re.match(r"^[+|][-+|]*[+|]?$", s):
+            continue
+        cells = _cqlsh_row_cells(line)
+        if not cells:
+            continue
+        lowered = [c.lower() for c in cells]
+        if "table_name" in lowered:
+            col_idx = lowered.index("table_name")
+            break
+        if len(cells) == 1 and lowered[0] in ("table_name", "name"):
+            col_idx = 0
+            break
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r"^[+|][-+|]*[+|]?$", s) or re.match(r"^[-+|][-+| ]*$", s):
+            continue
+        if "rows)" in s.lower() and s.startswith("("):
+            continue
+        if "|" not in line:
+            cell = s
+        else:
+            parts = _cqlsh_row_cells(line)
+            if col_idx >= len(parts):
+                continue
+            cell = parts[col_idx]
+        low = cell.lower()
+        if low in ("table_name", "name", "keyspace_name"):
+            continue
+        if not _KEYSPACE_IDENT.match(cell):
+            continue
+        if cell not in seen:
+            seen.add(cell)
+            names.append(cell)
+    names.sort(key=str.lower)
+    return names

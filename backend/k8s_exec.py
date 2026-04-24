@@ -12,6 +12,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend import pg_cassandra as pgcass
+
 KAFKA_POD = "glassbox-kafka-0"
 KAFKA_CONTAINER = "kafka"
 KAFKA_BIN = "/opt/bitnami/kafka/bin"
@@ -39,6 +41,12 @@ KAFKA_CONNECT_LOCAL = "http://127.0.0.1:8083"
 # Glassbox chart uses this container name (Bitnami chart default is often ``postgresql``).
 POSTGRES_CONTAINER = os.environ.get("GB_STS_PG_CONTAINER", "glassbox-postgresql").strip() or "glassbox-postgresql"
 CASSANDRA_CONTAINER = os.environ.get("GB_STS_CASS_CONTAINER", "cassandra").strip() or "cassandra"
+CLINGINE_CONTAINER = os.environ.get("GB_STS_CLINGINE_CONTAINER", "clingine").strip() or "clingine"
+# Clingine: embedded Cassandra + app logs (not container stdout).
+CLINGINE_LOG_FILE = "/root/clingine/log/servers.root.log"
+CLINGINE_NODETOOL_DEFAULT = "/root/clingine/bin/nodetool.sh"
+
+_CLINGINE_POD_INDEX = re.compile(r"^clingine-(\d+)$")
 
 # Commands that must never run without an explicit user confirmation flag.
 _WRITE_MARKERS = (
@@ -81,7 +89,9 @@ def sanitize_kafka_logs_container(container: str) -> str | None:
     return None
 
 
-_LOG_WORKLOADS = frozenset({"kafka", "clickhouse", "elasticsearch", "opensearch", "kafkaconnect", "postgresql", "cassandra"})
+_LOG_WORKLOADS = frozenset(
+    {"kafka", "clickhouse", "elasticsearch", "opensearch", "kafkaconnect", "postgresql", "cassandra", "clingine"}
+)
 _CH_LOG_POD = re.compile(r"^glassbox-clickhouse-(\d+)$")
 _ES_LOG_POD = re.compile(r"^glassbox-elasticsearch-master-(\d+)$")
 _OS_LOG_POD = re.compile(r"^glassbox-opensearch-master-(\d+)$")
@@ -89,6 +99,7 @@ _KC_LOG_POD = re.compile(r"^glassbox-kafkaconnect-(\d+)$")
 _PG_LOG_SINGLE = re.compile(r"^glassbox-postgresql-(\d+)$")
 _PG_LOG_HA = re.compile(r"^glassbox-postgresql-ha-postgresql-(\d+)$")
 _CASS_LOG_POD = re.compile(r"^glassbox-cassandra-(\d+)$")
+_CLINGINE_LOG_POD = re.compile(r"^clingine-(\d+)$")
 
 
 def sanitize_pod_for_workload(workload: str, pod: str) -> str | None:
@@ -134,6 +145,12 @@ def sanitize_pod_for_workload(workload: str, pod: str) -> str | None:
             return None
         i = int(m.group(1))
         return p if 0 <= i <= 31 else None
+    if w == "clingine":
+        m = _CLINGINE_LOG_POD.match(p)
+        if not m:
+            return None
+        i = int(m.group(1))
+        return p if 0 <= i <= 31 else None
     return None
 
 
@@ -153,6 +170,8 @@ def sanitize_workload_logs_container(workload: str, container: str) -> str | Non
     if w == "postgresql" and c == POSTGRES_CONTAINER:
         return c
     if w == "cassandra" and c == CASSANDRA_CONTAINER:
+        return c
+    if w == "clingine" and c == CLINGINE_CONTAINER:
         return c
     return None
 
@@ -668,6 +687,95 @@ def postgres_psql_query(
     return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
 
 
+def clingine_cql_host_for_pod(clingine_pod_name: str) -> str | None:
+    """``clingine-<n>`` → ``{GB_STS_CLINGINE_EXTERNAL_PREFIX|clingine-external}-<n>`` (DNS in-cluster)."""
+    m = _CLINGINE_POD_INDEX.match((clingine_pod_name or "").strip())
+    if not m:
+        return None
+    prefix = (os.environ.get("GB_STS_CLINGINE_EXTERNAL_PREFIX") or "clingine-external").strip() or "clingine-external"
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9-]{0,62}$", prefix):
+        prefix = "clingine-external"
+    return f"{prefix}-{int(m.group(1))}"
+
+
+def clingine_cqlsh_via_cassandra_proxy(
+    namespace: str,
+    clingine_pod_name: str,
+    cql: str,
+    *,
+    timeout: int = 180,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+) -> CmdResult:
+    """
+    Clingine pods have no ``cqlsh``. Run ``cqlsh`` inside a Cassandra chart pod (default
+    ``glassbox-cassandra-0``) with ``CQLSH_HOST`` / ``CQLSH_PORT`` set to the Clingine external
+    service (``clingine-external-<n>`` : ``8186`` by default).
+    """
+    host = clingine_cql_host_for_pod(clingine_pod_name)
+    if not host:
+        return CmdResult(
+            ok=False,
+            stdout="",
+            stderr="invalid clingine pod for CQL (expected clingine-<n>)",
+            returncode=2,
+            cmd_display="(rejected)",
+        )
+    port_raw = (os.environ.get("GB_STS_CLINGINE_CQL_PORT") or "8186").strip() or "8186"
+    if not port_raw.isdigit() or not (1 <= len(port_raw) <= 5):
+        return CmdResult(
+            ok=False,
+            stdout="",
+            stderr="invalid GB_STS_CLINGINE_CQL_PORT",
+            returncode=2,
+            cmd_display="(rejected)",
+        )
+    proxy_raw = (os.environ.get("GB_STS_CLINGINE_CQLSH_PROXY_POD") or "glassbox-cassandra-0").strip() or "glassbox-cassandra-0"
+    proxy_pod = sanitize_pod_for_workload("cassandra", proxy_raw)
+    if not proxy_pod:
+        return CmdResult(
+            ok=False,
+            stdout="",
+            stderr="invalid GB_STS_CLINGINE_CQLSH_PROXY_POD (use glassbox-cassandra-<n>)",
+            returncode=2,
+            cmd_display="(rejected)",
+        )
+    b64 = base64.b64encode((cql or "").encode("utf-8")).decode("ascii")
+    b64q = shlex.quote(b64)
+    host_q = shlex.quote(host)
+    port_q = shlex.quote(port_raw)
+    explicit = os.environ.get("GB_STS_CQLSH", "").strip()
+    if explicit:
+        qbin = shlex.quote(explicit)
+        inner = (
+            f"decoded=$(echo {b64q} | base64 -d) && "
+            f"export CQLSH_HOST={host_q} CQLSH_PORT={port_q} && "
+            f"{qbin} -e \"$decoded\""
+        )
+    else:
+        inner = (
+            f"decoded=$(echo {b64q} | base64 -d) && "
+            f"export CQLSH_HOST={host_q} CQLSH_PORT={port_q} && "
+            "CQLSH=\"\"; "
+            "for p in /opt/bitnami/cassandra/bin/cqlsh /opt/apache-cassandra/bin/cqlsh "
+            "/usr/bin/cqlsh /usr/local/bin/cqlsh; do "
+            "  if [ -x \"$p\" ]; then CQLSH=\"$p\"; break; fi; "
+            "done; "
+            "if [ -z \"$CQLSH\" ] && command -v cqlsh >/dev/null 2>&1; then CQLSH=$(command -v cqlsh); fi; "
+            "if [ -z \"$CQLSH\" ]; then echo \"cqlsh not found (set GB_STS_CQLSH to the in-pod path on the Cassandra pod)\" >&2; exit 127; fi; "
+            '"$CQLSH" -e "$decoded"'
+        )
+    return pod_bash_lc_exec(
+        namespace,
+        proxy_pod,
+        CASSANDRA_CONTAINER,
+        inner,
+        timeout=timeout,
+        aws_profile=aws_profile,
+        cloud=cloud,
+    )
+
+
 def cassandra_nodetool_readonly(
     namespace: str,
     pod_name: str,
@@ -677,11 +785,26 @@ def cassandra_nodetool_readonly(
     timeout: int = 220,
     aws_profile: str | None = None,
     cloud: str | None = None,
+    nodetool_bin: str | None = None,
+    rpc_host: str | None = None,
+    jmx_port: str | None = None,
+    tablestats_keyspace: str | None = None,
+    tablestats_table: str | None = None,
+    retries: int = 1,
+    retry_sleep_secs: int = 1,
 ) -> CmdResult:
     """
     Run a fixed read-only ``nodetool`` subcommand inside the Cassandra pod (no JMX mutations).
 
-    Override binary with env ``GB_STS_NODETOOL`` (absolute path on the pod).
+    Override binary with env ``GB_STS_NODETOOL`` (absolute path on the pod), or pass ``nodetool_bin``
+    for Clingine (e.g. ``/root/clingine/bin/nodetool.sh``).
+
+    ``jmx_port`` adds ``-p <port>`` (JMX) when set — needed for some Clingine images where JMX is not
+    on nodetool's default. ``tablestats_keyspace`` + ``tablestats_table`` narrow ``tablestats`` to one CF.
+
+    ``retries`` (>=1) wraps the nodetool invocation in a bash retry loop with ``retry_sleep_secs``
+    between attempts; the loop exits on first success and otherwise returns the last attempt's output
+    and exit status. Use this for flaky JMX (e.g. Clingine's embedded Cassandra).
     """
     allowed: dict[str, tuple[str, int]] = {
         "status": ("status", 800),
@@ -701,12 +824,153 @@ def cassandra_nodetool_readonly(
             cmd_display="(rejected)",
         )
     sub, cap = allowed[key]
-    nt_default = "/opt/bitnami/cassandra/bin/nodetool"
-    nt_path = os.environ.get("GB_STS_NODETOOL", nt_default).strip() or nt_default
+    if key == "tablestats" and tablestats_keyspace and tablestats_table:
+        cap = min(cap, 8000)
+    if nodetool_bin and str(nodetool_bin).strip():
+        nt_path = str(nodetool_bin).strip()
+    else:
+        nt_default = "/opt/bitnami/cassandra/bin/nodetool"
+        nt_path = os.environ.get("GB_STS_NODETOOL", nt_default).strip() or nt_default
     ntq = shlex.quote(nt_path)
-    inner = f"if [ ! -x {ntq} ]; then echo 'nodetool not found (set GB_STS_NODETOOL to the in-pod path)' >&2; exit 127; fi; "
-    inner += f"{ntq} -h localhost {sub} 2>&1 | head -n {cap}"
+    rpc = (rpc_host or "localhost").strip() or "localhost"
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", rpc):
+        return CmdResult(
+            ok=False,
+            stdout="",
+            stderr="invalid rpc_host for nodetool",
+            returncode=2,
+            cmd_display="(rejected)",
+        )
+    rpc_q = shlex.quote(rpc)
+    jmx_suffix = ""
+    if jmx_port is not None and str(jmx_port).strip():
+        jp = str(jmx_port).strip()
+        if jp.isdigit() and 1 <= len(jp) <= 5:
+            jmx_suffix = f" -p {shlex.quote(jp)}"
+    sub_cmd = sub
+    if key == "tablestats" and tablestats_keyspace and tablestats_table:
+        try:
+            ks = pgcass.sanitize_cassandra_keyspace(tablestats_keyspace)
+            tb = pgcass.sanitize_cassandra_table(tablestats_table)
+        except ValueError as e:
+            return CmdResult(
+                ok=False,
+                stdout="",
+                stderr=str(e),
+                returncode=2,
+                cmd_display="(rejected)",
+            )
+        sub_cmd = f"tablestats {shlex.quote(ks)}.{shlex.quote(tb)}"
+    inner = f"if [ ! -f {ntq} ] && [ ! -x {ntq} ]; then echo 'nodetool not found (set GB_STS_NODETOOL or pass nodetool_bin)' >&2; exit 127; fi; "
+    nt_invocation = f"{ntq} -h {rpc_q}{jmx_suffix} {sub_cmd}"
+    n = max(1, int(retries or 1))
+    sleep_s = max(0, int(retry_sleep_secs or 0))
+    if n <= 1:
+        inner += f"{nt_invocation} 2>&1 | head -n {cap}"
+    else:
+        # Retry wrapper: capture combined stdout+stderr, break on first success, otherwise
+        # emit the last attempt's output and exit with its return code.
+        iters = " ".join(str(i) for i in range(1, n + 1))
+        inner += (
+            f"_NT_OUT=''; _NT_EC=1; "
+            f"for _NT_I in {iters}; do "
+            f"_NT_OUT=\"$({nt_invocation} 2>&1)\"; _NT_EC=$?; "
+            f"[ $_NT_EC -eq 0 ] && break; "
+            f"sleep {sleep_s}; "
+            f"done; "
+            f"printf '%s\\n' \"$_NT_OUT\" | head -n {cap}; "
+            f"exit $_NT_EC"
+        )
     return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
+
+
+def _clingine_nodetool_jmx_stderr_flaky(stderr: str | None, stdout: str | None = None) -> bool:
+    """True when the nodetool result smells like a JMX hiccup we should retry with a different port.
+
+    Inspects both stderr and stdout because the retry wrapper folds ``2>&1`` into stdout.
+    """
+    s = ((stderr or "") + "\n" + (stdout or "")).lower()
+    if not s.strip():
+        return False
+    return (
+        "nosuchobjectexception" in s
+        or "no such object" in s
+        or "failed to connect" in s
+        or "broken pipe" in s
+        or "connection refused" in s
+    )
+
+
+CLINGINE_NODETOOL_DEFAULT_JMX_PORT = "30081"
+
+
+def clingine_nodetool_readonly(
+    namespace: str,
+    pod_name: str,
+    container: str,
+    op: str,
+    *,
+    timeout: int = 240,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+    nodetool_bin: str | None = None,
+    tablestats_keyspace: str | None = None,
+    tablestats_table: str | None = None,
+    retries: int = 5,
+    retry_sleep_secs: int = 1,
+) -> CmdResult:
+    """
+    Nodetool against Clingine's embedded Cassandra (best-effort).
+
+    Clingine's JMX is on port ``30081`` (not 7199) and the connection is intermittently flaky
+    (``Failed to connect to 'localhost:30081' - NoSuchObjectException``). To match the operator's
+    workaround we wrap each invocation in a 5-attempt loop with a 1-second sleep between attempts:
+
+        for i in 1 2 3 4 5; do nodetool.sh -h localhost -p 30081 <op> && break || sleep 1; done
+
+    JMX port selection (``GB_STS_CLINGINE_JMX_PORT``):
+      - **unset / empty** → use ``-p 30081`` (the listening port observed on the pod).
+      - **digits** (e.g. ``9081``) → pin to that port.
+      - **off / none / - / 0** → omit ``-p`` entirely (let nodetool pick its default).
+
+    On flaky JMX stderr we retry with ``-p`` omitted as a last-ditch fallback (only when the env
+    is not pinning a specific port).
+    """
+    raw = (os.environ.get("GB_STS_CLINGINE_JMX_PORT") or "").strip()
+
+    def one(jmx: str | None) -> CmdResult:
+        return cassandra_nodetool_readonly(
+            namespace,
+            pod_name,
+            container,
+            op,
+            timeout=timeout,
+            aws_profile=aws_profile,
+            cloud=cloud,
+            nodetool_bin=nodetool_bin,
+            jmx_port=jmx,
+            tablestats_keyspace=tablestats_keyspace,
+            tablestats_table=tablestats_table,
+            retries=retries,
+            retry_sleep_secs=retry_sleep_secs,
+        )
+
+    if raw.isdigit() and 1 <= len(raw) <= 5:
+        return one(raw)
+    if raw.lower() in ("off", "none", "-", "0"):
+        r0 = one(None)
+        if r0.ok or not _clingine_nodetool_jmx_stderr_flaky(r0.stderr, r0.stdout):
+            return r0
+        return one(CLINGINE_NODETOOL_DEFAULT_JMX_PORT)
+
+    r1 = one(CLINGINE_NODETOOL_DEFAULT_JMX_PORT)
+    if r1.ok:
+        return r1
+    if _clingine_nodetool_jmx_stderr_flaky(r1.stderr, r1.stdout):
+        r2 = one(None)
+        if r2.ok:
+            return r2
+    return r1
 
 
 def cassandra_cqlsh_query(

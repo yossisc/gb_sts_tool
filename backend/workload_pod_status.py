@@ -12,7 +12,7 @@ from backend import k8s_exec as kx
 from backend import stack_components as stack
 
 _ALLOWED_WORKLOADS = frozenset(
-    {"kafka", "kafkaconnect", "clickhouse", "elasticsearch", "opensearch", "postgresql", "cassandra"}
+    {"kafka", "kafkaconnect", "clickhouse", "elasticsearch", "opensearch", "postgresql", "cassandra", "clingine"}
 )
 
 _WORKLOAD_DISK_PATH: dict[str, str | None] = {
@@ -23,6 +23,8 @@ _WORKLOAD_DISK_PATH: dict[str, str | None] = {
     "clickhouse": "/var/lib/clickhouse",
     "postgresql": "/bitnami/postgresql",
     "cassandra": "/bitnami/cassandra",
+    # Clingine: two local data dirs per pod; df probes recent0 (see page copy for recent1).
+    "clingine": "/root/data/recent0",
 }
 
 _WORKLOAD_CONTAINER: dict[str, str | None] = {
@@ -33,6 +35,7 @@ _WORKLOAD_CONTAINER: dict[str, str | None] = {
     "clickhouse": kx.CLICKHOUSE_CONTAINER,
     "postgresql": kx.POSTGRES_CONTAINER,
     "cassandra": kx.CASSANDRA_CONTAINER,
+    "clingine": kx.CLINGINE_CONTAINER,
 }
 
 

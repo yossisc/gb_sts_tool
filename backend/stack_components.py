@@ -48,12 +48,6 @@ STACK_COMPONENTS: list[ComponentSpec] = [
         "notes": "StatefulSet prefix; REST API on localhost:8083 inside pod.",
     },
     {
-        "id": "clingine",
-        "label": "Clingine",
-        "pod_prefixes": ["clingine-"],
-        "notes": "Scale-out; pick pod index in UI when supported.",
-    },
-    {
         "id": "clickhouse",
         "label": "ClickHouse",
         "pod_prefixes": ["glassbox-clickhouse-"],
@@ -64,6 +58,13 @@ STACK_COMPONENTS: list[ComponentSpec] = [
         "label": "PostgreSQL",
         "pod_prefixes": ["glassbox-postgresql-", "glassbox-postgresql-ha-postgresql-"],
         "notes": "Non-HA vs HA chart pod names.",
+    },
+    {
+        "id": "clingine",
+        "label": "Clingine",
+        "pod_prefixes": ["clingine-"],
+        "pod_pattern": r"^clingine-\d+$",
+        "notes": "One embedded Cassandra per pod; local data under /root/data/recent0 and /root/data/recent1.",
     },
     {
         "id": "cassandra",

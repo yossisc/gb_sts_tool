@@ -15,6 +15,7 @@ const navClickhouse = document.getElementById("nav-clickhouse");
 const navElasticsearch = document.getElementById("nav-elasticsearch");
 const navOpensearch = document.getElementById("nav-opensearch");
 const navPostgres = document.getElementById("nav-postgres");
+const navClingine = document.getElementById("nav-clingine");
 const navCassandra = document.getElementById("nav-cassandra");
 
 /** @type {Array<[HTMLElement | null, string]>} anchor → ``stack.components`` id */
@@ -25,6 +26,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navElasticsearch, "elasticsearch"],
   [navOpensearch, "opensearch"],
   [navPostgres, "postgresql"],
+  [navClingine, "clingine"],
   [navCassandra, "cassandra"],
 ];
 
@@ -45,6 +47,7 @@ const WL_STACK_COMP = {
   elasticsearch: "elasticsearch",
   opensearch: "opensearch",
   postgresql: "postgresql",
+  clingine: "clingine",
   cassandra: "cassandra",
 };
 
@@ -56,6 +59,7 @@ const WORKLOAD_ROUTE_TO_COMP = [
   ["#/opensearch", "opensearch"],
   ["#/clickhouse", "clickhouse"],
   ["#/postgres", "postgresql"],
+  ["#/clingine", "clingine"],
   ["#/cassandra", "cassandra"],
 ];
 
@@ -66,6 +70,7 @@ const WL_DEFAULT_POD = {
   elasticsearch: "glassbox-elasticsearch-master-0",
   opensearch: "glassbox-opensearch-master-0",
   postgresql: "glassbox-postgresql-0",
+  clingine: "clingine-0",
   cassandra: "glassbox-cassandra-0",
 };
 
@@ -172,9 +177,13 @@ function redrawWorkloadLogDisplay(outEl, rawLines, filterNeedle) {
 /**
  * @param {string} workload
  * @param {string} title
+ * @param {{ streamNoteHtml?: string }} [opts]
  */
-function workloadLogsPanelHtml(workload, title) {
+function workloadLogsPanelHtml(workload, title, opts = {}) {
   const idBase = `wl-${workload}`;
+  const streamNote =
+    opts.streamNoteHtml ||
+    "Stream <code>kubectl logs</code> (<code>--tail 10</code>, <code>-f</code>). <strong>Deactivate</strong> stops the stream; leaving this page also stops it. <strong>Clear</strong> empties the buffer.";
   return `
     <section class="panel panel--span-all kafka-logs-section" data-workload-logs="${esc(workload)}">
       <div class="panel-head workload-logs-head">
@@ -190,7 +199,7 @@ function workloadLogsPanelHtml(workload, title) {
         </div>
       </div>
       <p class="muted">
-        Stream <code>kubectl logs</code> (<code>--tail 10</code>, <code>-f</code>). <strong>Deactivate</strong> stops the stream; leaving this page also stops it. <strong>Clear</strong> empties the buffer.
+        ${streamNote}
       </p>
       <div class="panel-toolbar kafka-logs-toolbar">
         <label class="field field--inline">
@@ -213,7 +222,7 @@ function workloadLogsPanelHtml(workload, title) {
 }
 
 /**
- * @param {string} workload kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|cassandra
+ * @param {string} workload kafka|kafkaconnect|clickhouse|elasticsearch|opensearch|postgresql|clingine|cassandra
  */
 function workloadPodStatusPanelHtml(workload) {
   const w = esc(workload);
@@ -393,6 +402,7 @@ function workloadLogContainerDefault(workload) {
     elasticsearch: "elasticsearch",
     opensearch: "opensearch",
     postgresql: "glassbox-postgresql",
+    clingine: "clingine",
     cassandra: "cassandra",
   };
   return fb[workload] || "kafka";
@@ -777,6 +787,7 @@ function workloadDisplayName(compKey) {
       elasticsearch: "Elasticsearch",
       opensearch: "OpenSearch",
       postgresql: "PostgreSQL",
+      clingine: "Clingine",
       cassandra: "Cassandra",
     }[compKey] || compKey
   );
@@ -981,7 +992,7 @@ document.addEventListener("click", (ev) => {
   }
 });
 
-/** @param {{ index: number, variant: "topic" | "group" | "es_index" | "cassandra_keyspace" }} pick */
+/** @param {{ index: number, variant: "topic" | "group" | "es_index" | "cassandra_keyspace" | "clingine_keyspace" | "clingine_table", keyspaceEncoded?: string }} pick */
 /** Headers that represent numeric metrics (size, counts, lag) even when the column was only marked string-sortable. */
 function isNumericSortHeaderLabel(label) {
   const raw = String(label ?? "").trim();
@@ -1028,6 +1039,29 @@ function kafkaPickCellInner(cell, ci, pick) {
       "Fill keyspace name fields (Describe / Tables)",
     )}">${esc(cell == null ? "" : String(cell))}</button>`;
   }
+  if (pick.variant === "clingine_keyspace") {
+    return `<button type="button" class="cell-link js-clg-pick-keyspace" data-name="${enc}" title="${esc(
+      "Fill keyspace name fields (Describe / Tables)",
+    )}">${esc(cell == null ? "" : String(cell))}</button>`;
+  }
+  if (pick.variant === "clingine_table") {
+    if (pick.index !== ci) return esc(cell == null ? "" : String(cell));
+    let ksRaw = "";
+    if (pick.keyspaceEncoded) {
+      try {
+        ksRaw = decodeURIComponent(pick.keyspaceEncoded);
+      } catch {
+        ksRaw = "";
+      }
+    } else if (pick.keyspaceAtRender != null) {
+      ksRaw = String(pick.keyspaceAtRender).trim();
+    }
+    const encKs = encodeURIComponent(ksRaw);
+    const encTn = encodeURIComponent(String(cell ?? ""));
+    return `<button type="button" class="cell-link js-clg-pick-table" data-ks="${encKs}" data-table="${encTn}" title="${esc(
+      "Fill Nodetool Keyspace / Table for tablestats",
+    )}">${esc(cell == null ? "" : String(cell))}</button>`;
+  }
   const cls = pick.variant === "group" ? "js-kafka-pick-group" : "js-kafka-pick-topic";
   const label = pick.variant === "group" ? "Use this consumer group" : "Use this topic for describe / offsets";
   return `<button type="button" class="cell-link ${cls}" data-name="${enc}" title="${esc(label)}">${esc(
@@ -1039,13 +1073,22 @@ function kafkaPickCellInner(cell, ci, pick) {
 function kafkaDataRowHtml(cells, table) {
   const pickCol = table.getAttribute("data-pick-col");
   const pickVar = table.getAttribute("data-pick-variant");
+  const pickKsEnc = table.getAttribute("data-pick-ks") || "";
   const pick =
     pickCol != null &&
     pickCol !== "" &&
-    (pickVar === "topic" || pickVar === "group" || pickVar === "es_index" || pickVar === "cassandra_keyspace")
+    (pickVar === "topic" ||
+      pickVar === "group" ||
+      pickVar === "es_index" ||
+      pickVar === "cassandra_keyspace" ||
+      pickVar === "clingine_keyspace" ||
+      pickVar === "clingine_table")
       ? {
           index: Number.parseInt(pickCol, 10),
-          variant: /** @type {"topic"|"group"|"es_index"|"cassandra_keyspace"} */ (pickVar),
+          variant: /** @type {"topic"|"group"|"es_index"|"cassandra_keyspace"|"clingine_keyspace"|"clingine_table"} */ (
+            pickVar
+          ),
+          keyspaceEncoded: pickVar === "clingine_table" ? pickKsEnc : "",
         }
       : null;
   return `<tr>${cells
@@ -1067,6 +1110,9 @@ function renderTable(rows, opts = {}) {
   let pickAttr = "";
   if (pick) {
     pickAttr = ` data-pick-col="${pick.index}" data-pick-variant="${pick.variant}"`;
+    if (pick.variant === "clingine_table" && pick.keyspaceAtRender != null && String(pick.keyspaceAtRender).trim()) {
+      pickAttr += ` data-pick-ks="${esc(encodeURIComponent(String(pick.keyspaceAtRender).trim()))}"`;
+    }
   }
   let html = `<table class="data-table${tc}"${pickAttr}>`;
   let start = 0;
@@ -3035,6 +3081,7 @@ function renderOpensearch() {
 
 const PG_HISTORY_KEY = "gb_sts_pg_queries_v1";
 const CASS_HISTORY_KEY = "gb_sts_cassandra_queries_v1";
+const CLG_HISTORY_KEY = "gb_sts_clingine_queries_v1";
 
 /**
  * @param {string} key
@@ -3849,6 +3896,550 @@ function renderCassandra() {
   wireWorkloadLogs(app, "cassandra");
 }
 
+function renderClingine() {
+  if (!sessionVerified) {
+    app.innerHTML =
+      "<div class='callout callout-warn'>Connect from <a href='#/'>Home</a> first. The Clingine page requires a verified session.</div>";
+    return;
+  }
+  app.innerHTML = `
+    <p class="muted">
+      Each <strong>Clingine</strong> pod runs its own embedded Cassandra (not a shared multi-node cluster). Data is on local mounts
+      <code>/root/data/recent0</code> and <code>/root/data/recent1</code> inside the pod. Use the pod dropdown so all panels talk to
+      <strong>one</strong> Clingine at a time. <strong>CQL</strong> does not run inside Clingine (no <code>cqlsh</code> there): the server runs
+      <code>cqlsh</code> on <code>glassbox-cassandra-0</code> (override with <code>GB_STS_CLINGINE_CQLSH_PROXY_POD</code>) with
+      <code>CQLSH_HOST=clingine-external-&lt;n&gt;</code> and <code>CQLSH_PORT=8186</code> (<code>GB_STS_CLINGINE_EXTERNAL_PREFIX</code>,
+      <code>GB_STS_CLINGINE_CQL_PORT</code>) so traffic hits the selected Clingine’s native CQL port. Read-only panels and custom CQL use the same path.
+    </p>
+    ${workloadPodStatusPanelHtml("clingine")}
+    <section class="panel">
+      <h2>Pod</h2>
+      <label class="field">
+        <span>Clingine pod</span>
+        <select class="text" id="clg-pod-select"></select>
+      </label>
+    </section>
+    <section class="panel" id="clg-keyspaces-panel">
+      <h2>Keyspaces</h2>
+      <p class="hint" style="margin-top:0;">Runs <code>SELECT keyspace_name FROM system_schema.keyspaces</code> (read-only). Click a keyspace in the table to fill the fields below.</p>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <button type="button" class="btn btn-primary" id="clg-keyspaces-refresh">Refresh</button>
+        <label class="field field--inline">
+          <span>Filter visible rows</span>
+          <input class="text" id="clg-keyspaces-filter" type="text" maxlength="200" autocomplete="off" placeholder="substring" />
+        </label>
+      </div>
+      <div id="clg-keyspaces-out" style="margin-top:0.75rem;"><p class="muted">Loading…</p></div>
+    </section>
+    <section class="panel">
+      <h2>Describe keyspace</h2>
+      <label class="field">
+        <span>Keyspace name</span>
+        <input class="text" id="clg-desc-ks" type="text" placeholder="glassbox" autocomplete="off" />
+      </label>
+      <p style="margin-top:0.75rem;"><button type="button" class="btn btn-primary" id="clg-desc-refresh">Describe</button></p>
+      <div id="clg-desc-out"><p class="muted">Output appears here.</p></div>
+    </section>
+    <section class="panel" id="clg-tables-section">
+      <h2>Tables in keyspace</h2>
+      <label class="field">
+        <span>Keyspace name</span>
+        <input class="text" id="clg-tables-ks" type="text" placeholder="glassbox" autocomplete="off" />
+      </label>
+      <p style="margin-top:0.75rem;"><button type="button" class="btn btn-primary" id="clg-tables-refresh">List tables</button></p>
+      <div id="clg-tables-out"><p class="muted">Runs <code>SELECT table_name FROM system_schema.tables …</code> via Cassandra pod cqlsh. Click a row to fill Nodetool fields for <code>tablestats</code>.</p></div>
+    </section>
+    <section class="panel exec-box">
+      <h2>Custom CQL</h2>
+      <p class="muted">Last 10 successful statements (exit 0) are kept in <code>sessionStorage</code> for this tab.</p>
+      <p class="hint">Recent OK CQL (newest first)</p>
+      <ul id="clg-query-history" class="query-history-list"></ul>
+      <textarea id="clg-exec-cql" spellcheck="false" rows="7" placeholder="DESCRIBE KEYSPACES;"></textarea>
+      <p style="margin-top:0.75rem;">
+        <button type="button" class="btn btn-primary" id="clg-exec-run">Run</button>
+        <button type="button" class="btn btn-danger" id="clg-exec-run-confirmed" hidden>Run with confirmation</button>
+      </p>
+      <div id="clg-exec-out-wrap" class="exec-out-wrap" hidden>
+        <div id="clg-exec-out-inner"></div>
+        <div class="panel-output-footer">
+          <label class="exec-json-chk"><input type="checkbox" id="clg-exec-json" /> json</label>
+        </div>
+      </div>
+    </section>
+    <section class="kafka-subject" aria-labelledby="clg-subject-nt">
+      <h2 class="kafka-subject-title" id="clg-subject-nt">Nodetool (read-only)</h2>
+      <p class="muted" style="margin-top:0;">
+        Runs <code>/root/clingine/bin/nodetool.sh -h localhost -p 30081 …</code> inside the Clingine pod
+        (override binary with <code>GB_STS_CLINGINE_NODETOOL</code>). Treated as <strong>best-effort</strong>:
+        each call is wrapped in a 5-attempt retry loop with a 1&nbsp;s sleep, mirroring
+        <code>for i in 1 2 3 4 5; do nodetool.sh -h localhost -p 30081 &lt;op&gt; &amp;&amp; break || sleep 1; done</code>.
+        JMX port: <code>GB_STS_CLINGINE_JMX_PORT</code> defaults to <code>30081</code>; set digits to pin a different port,
+        or <code>off</code>/<code>none</code>/<code>-</code> to omit <code>-p</code>.
+        <strong>Table stats</strong> requires keyspace + table below (or use the clickable table list). Other panels use substring filters on loaded output.
+      </p>
+      <section class="panel kafka-subject-params" style="margin-top:0.75rem;">
+        <h3 class="muted" style="margin:0 0 0.5rem;font-size:1rem;">Nodetool keyspace / table (for Table stats)</h3>
+        <div class="panel-toolbar kafka-logs-toolbar" style="flex-wrap:wrap;">
+          <label class="field field--inline">
+            <span>KEYSPACE</span>
+            <input class="text" id="clg-nt-keyspace" type="text" maxlength="120" autocomplete="off" placeholder="e.g. raw_20260104" />
+          </label>
+          <label class="field field--inline">
+            <span>TABLE</span>
+            <input class="text" id="clg-nt-table" type="text" maxlength="120" autocomplete="off" placeholder="column family name" />
+          </label>
+        </div>
+      </section>
+      <div class="panels-grid" id="clg-nt-grid"></div>
+    </section>
+    ${workloadLogsPanelHtml("clingine", "Clingine application log", {
+      streamNoteHtml:
+        "Stream <code>kubectl exec</code> · <code>tail -n 200 -f /root/clingine/log/servers.root.log</code> (not container stdout). <strong>Deactivate</strong> stops the stream; leaving this page also stops it. <strong>Clear</strong> empties the buffer.",
+    })}
+  `;
+
+  function renderClgHistoryUi() {
+    const ul = document.getElementById("clg-query-history");
+    if (!ul) return;
+    const items = readRotatingQueries(CLG_HISTORY_KEY).slice().reverse();
+    ul.innerHTML = items.length
+      ? items
+          .map(
+            (q) =>
+              `<li><button type="button" class="btn query-history-btn js-clg-hist" data-q="${esc(
+                encodeURIComponent(q),
+              )}">${esc(q.length > 140 ? `${q.slice(0, 140)}…` : q)}</button></li>`,
+          )
+          .join("")
+      : "<li class='muted'>(none yet)</li>";
+  }
+
+  (async () => {
+    const sel = document.getElementById("clg-pod-select");
+    if (!sel) return;
+    sel.innerHTML = "";
+    {
+      const o = document.createElement("option");
+      o.value = "clingine-0";
+      o.textContent = "clingine-0";
+      sel.appendChild(o);
+    }
+    let stack = null;
+    try {
+      stack = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+    } catch {
+      stack = null;
+    }
+    if (!stack?.components) {
+      try {
+        stack = await fetchJson("/api/k8s/stack");
+      } catch {
+        stack = null;
+      }
+    }
+    const pods = stack?.components?.clingine?.pods;
+    sel.innerHTML = "";
+    if (Array.isArray(pods) && pods.length) {
+      for (const name of pods.slice(0, 32)) {
+        const o = document.createElement("option");
+        o.value = String(name);
+        o.textContent = String(name);
+        sel.appendChild(o);
+      }
+    } else {
+      const o = document.createElement("option");
+      o.value = "clingine-0";
+      o.textContent = "clingine-0";
+      sel.appendChild(o);
+    }
+    await refreshClgKeyspaces();
+  })();
+
+  renderClgHistoryUi();
+  document.getElementById("clg-query-history")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-clg-hist");
+    if (!b) return;
+    const enc = b.getAttribute("data-q");
+    const ta = document.getElementById("clg-exec-cql");
+    if (enc && ta) {
+      try {
+        ta.value = decodeURIComponent(enc);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  function clgPod() {
+    return document.getElementById("clg-pod-select")?.value ?? "";
+  }
+
+  async function loadClgPanel(panel, extra = {}) {
+    const u = new URL("/api/clingine/panel", location.origin);
+    u.searchParams.set("panel", panel);
+    u.searchParams.set("clingine_pod", clgPod());
+    if (extra.keyspace) u.searchParams.set("keyspace", extra.keyspace);
+    return fetchJson(u.toString());
+  }
+
+  /**
+   * @param {unknown} j
+   */
+  function renderClgKeyspacesOut(j) {
+    const out = document.getElementById("clg-keyspaces-out");
+    if (!out) return;
+    if (!j || typeof j !== "object" || !j.ok) {
+      const err = /** @type {{ error?: string, stderr?: string, stdout?: string }} */ (j || {});
+      delete out._gbStsLastTable;
+      delete out._gbStsTableRenderOpts;
+      out.innerHTML = `<p class="status-bad">${esc(err.error || err.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+        [err.stdout, err.stderr].filter(Boolean).join("\n"),
+      )}`;
+      bindCopyButtons(out);
+      return;
+    }
+    let inner = `<p class='hint'>${esc(String(/** @type {{ cql_executed?: string }} */ (j).cql_executed || ""))}</p>`;
+    const via = /** @type {{ cql_via?: string }} */ (j).cql_via;
+    if (via) inner += `<p class="muted">${esc(String(via))}</p>`;
+    const table = /** @type {{ table?: string[][] }} */ (j).table;
+    const tro = {
+      theadFirstRow: true,
+      tableClass: "es-cat-table",
+      pickColumn: { index: 0, variant: /** @type {"clingine_keyspace"} */ ("clingine_keyspace") },
+      stringSortableColumnIndexes: [0],
+    };
+    if (Array.isArray(table) && table.length > 1) {
+      inner += kafkaTopicDataTableScroll(renderTable(table, tro));
+    } else if (Array.isArray(table) && table.length === 1) {
+      inner += "<p class='muted'>(no keyspaces found)</p>";
+    }
+    const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+    inner += kafkaPreWithWrapFooter(blob);
+    out.innerHTML = inner;
+    bindCopyButtons(out);
+    if (Array.isArray(table) && table.length > 1) {
+      out._gbStsLastTable = table;
+      out._gbStsTableRenderOpts = tro;
+      const fv = document.getElementById("clg-keyspaces-filter")?.value ?? "";
+      if (fv.trim()) replaceTableScrollFromSubstringFilter(out, table, fv, tro);
+    } else {
+      delete out._gbStsLastTable;
+      delete out._gbStsTableRenderOpts;
+    }
+    const wrap = out.querySelector(".kafka-topic-table-scroll");
+    if (wrap) wireKafkaTableHeaderSort(wrap);
+  }
+
+  async function refreshClgKeyspaces() {
+    const out = document.getElementById("clg-keyspaces-out");
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadClgPanel("keyspaces");
+      renderClgKeyspacesOut(j);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  }
+
+  document.getElementById("clg-keyspaces-refresh")?.addEventListener("click", () => void refreshClgKeyspaces());
+  document.getElementById("clg-keyspaces-filter")?.addEventListener("input", () => {
+    const out = document.getElementById("clg-keyspaces-out");
+    const full = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+    const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+    const v = document.getElementById("clg-keyspaces-filter")?.value ?? "";
+    if (out instanceof HTMLElement && full && opts) replaceTableScrollFromSubstringFilter(out, full, v, opts);
+  });
+
+  async function loadClgNodetoolPanel(op, bodyId) {
+    const out = document.getElementById(bodyId);
+    if (!out) return;
+    const u = new URL("/api/clingine/nodetool", location.origin);
+    u.searchParams.set("op", op);
+    u.searchParams.set("clingine_pod", clgPod());
+    if (op === "tablestats") {
+      const ksNt = document.getElementById("clg-nt-keyspace")?.value?.trim() ?? "";
+      const tbNt = document.getElementById("clg-nt-table")?.value?.trim() ?? "";
+      if (!ksNt || !tbNt) {
+        out.innerHTML =
+          "<p class='status-bad'>Set <strong>KEYSPACE</strong> and <strong>TABLE</strong> under Nodetool (or click a table name in “Tables in keyspace”).</p>";
+        delete /** @type {{ _clgNtBundle?: unknown }} */ (out)._clgNtBundle;
+        return;
+      }
+      u.searchParams.set("nt_keyspace", ksNt);
+      u.searchParams.set("nt_table", tbNt);
+    }
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        delete /** @type {{ _clgNtBundle?: unknown }} */ (out)._clgNtBundle;
+        return;
+      }
+      const lines = String(j.stdout || "").split("\n");
+      out._clgNtBundle = {
+        stdoutLines: lines,
+        stderr: j.stderr,
+        returncode: j.returncode,
+        pod: j.pod,
+      };
+      paintClgNodetoolPanel(bodyId);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  }
+
+  function paintClgNodetoolPanel(bodyId) {
+    const out = document.getElementById(bodyId);
+    const b =
+      out &&
+      /** @type {{ _clgNtBundle?: { stdoutLines: string[]; stderr?: string; returncode?: number; pod?: string } }} */ (out)._clgNtBundle;
+    if (!(out instanceof HTMLElement) || !b || !Array.isArray(b.stdoutLines)) return;
+    const sub = document.getElementById(`${bodyId}-subf`);
+    const needle = sub instanceof HTMLInputElement ? sub.value : "";
+    const shown = filterTextLinesBySubstring(b.stdoutLines, needle);
+    let html = kafkaPreWithWrapFooter(shown.join("\n"));
+    if (b.stderr && String(b.stderr).trim()) html += kafkaPreWithWrapFooter(`--- stderr ---\n${b.stderr}`);
+    html += `<p class='hint'>exit ${esc(String(b.returncode ?? ""))} · pod ${esc(String(b.pod || ""))}</p>`;
+    out.innerHTML = html;
+    bindCopyButtons(out);
+  }
+
+  const ntOps = [
+    ["Cluster status", "status"],
+    ["Table stats", "tablestats"],
+    ["Thread pool stats", "tpstats"],
+    ["GC stats", "gcstats"],
+    ["Compaction stats", "compactionstats"],
+    ["Proxy histograms", "proxyhistograms"],
+  ];
+  const ntGrid = document.getElementById("clg-nt-grid");
+  if (ntGrid) {
+    let nth = "";
+    for (const [label, op] of ntOps) {
+      const bid = `clg-nt-${op}`;
+      nth += panelCard(`${label} (<code>nodetool ${esc(op)}</code>)`, bid, {
+        beforeBodyHtml: `<div class="panel-toolbar"><label class="field"><span>substring</span><input class="text" id="${esc(bid)}-subf" maxlength="200" autocomplete="off" placeholder="filter lines" /></label></div>`,
+      });
+    }
+    ntGrid.innerHTML = nth;
+    for (const [, op] of ntOps) {
+      const bid = `clg-nt-${op}`;
+      ntGrid.querySelector(`[data-refresh="${bid}"]`)?.addEventListener("click", () => void loadClgNodetoolPanel(op, bid));
+      document.getElementById(`${bid}-subf`)?.addEventListener("input", () => void paintClgNodetoolPanel(bid));
+      void loadClgNodetoolPanel(op, bid);
+    }
+    document.getElementById("clg-pod-select")?.addEventListener("change", () => {
+      void refreshClgKeyspaces();
+      for (const [, op] of ntOps) void loadClgNodetoolPanel(op, `clg-nt-${op}`);
+    });
+    const ntKsEl = document.getElementById("clg-nt-keyspace");
+    const ntTbEl = document.getElementById("clg-nt-table");
+    /** Only Table stats depends on KEYSPACE/TABLE fields — avoid reloading status/tpstats/etc. */
+    const reloadClgTablestatsOnly = () => {
+      void loadClgNodetoolPanel("tablestats", "clg-nt-tablestats");
+    };
+    ntKsEl?.addEventListener("change", () => reloadClgTablestatsOnly());
+    ntTbEl?.addEventListener("change", () => reloadClgTablestatsOnly());
+  }
+
+  document.getElementById("clg-keyspaces-panel")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-clg-pick-keyspace");
+    if (!b) return;
+    const enc = b.getAttribute("data-name");
+    if (enc == null) return;
+    let name = "";
+    try {
+      name = decodeURIComponent(enc);
+    } catch {
+      return;
+    }
+    const d = document.getElementById("clg-desc-ks");
+    const t = document.getElementById("clg-tables-ks");
+    const nk = document.getElementById("clg-nt-keyspace");
+    if (d) d.value = name;
+    if (t) t.value = name;
+    if (nk) nk.value = name;
+  });
+
+  document.getElementById("clg-desc-refresh")?.addEventListener("click", async () => {
+    const out = document.getElementById("clg-desc-out");
+    const ks = document.getElementById("clg-desc-ks")?.value?.trim() ?? "";
+    if (!out) return;
+    if (!ks) {
+      out.innerHTML = "<p class='status-bad'>Enter a keyspace name.</p>";
+      return;
+    }
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadClgPanel("desc_keyspace", { keyspace: ks });
+      if (!j.ok) {
+        out.innerHTML = `<p class="status-bad">${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        return;
+      }
+      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+      out.innerHTML = `<p class='hint'>${esc(String(j.cql_executed || ""))}</p>${kafkaPreWithWrapFooter(blob)}`;
+      bindCopyButtons(out);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  });
+
+  /**
+   * @param {unknown} j
+   */
+  function renderClgTablesOut(j) {
+    const out = document.getElementById("clg-tables-out");
+    if (!out) return;
+    const ks = document.getElementById("clg-tables-ks")?.value?.trim() ?? "";
+    if (!j || typeof j !== "object" || !j.ok) {
+      const err = /** @type {{ error?: string, stderr?: string, stdout?: string }} */ (j || {});
+      out.innerHTML = `<p class="status-bad">${esc(err.error || err.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+        [err.stdout, err.stderr].filter(Boolean).join("\n"),
+      )}`;
+      bindCopyButtons(out);
+      return;
+    }
+    let inner = `<p class='hint'>${esc(String(/** @type {{ cql_executed?: string }} */ (j).cql_executed || ""))}</p>`;
+    const viaT = /** @type {{ cql_via?: string }} */ (j).cql_via;
+    if (viaT) inner += `<p class="muted">${esc(String(viaT))}</p>`;
+    const table = /** @type {{ table?: string[][] }} */ (j).table;
+    const tro = {
+      theadFirstRow: true,
+      tableClass: "es-cat-table",
+      pickColumn: {
+        index: 0,
+        variant: /** @type {"clingine_table"} */ ("clingine_table"),
+        keyspaceAtRender: ks,
+      },
+      stringSortableColumnIndexes: [0],
+    };
+    if (Array.isArray(table) && table.length > 1) {
+      inner +=
+        '<p class="hint" style="margin-top:0.5rem;">Click a table name to fill <strong>KEYSPACE</strong> and <strong>TABLE</strong> under Nodetool (for <code>tablestats</code>).</p>';
+      inner += kafkaTopicDataTableScroll(renderTable(table, tro));
+    } else if (Array.isArray(table) && table.length === 1) {
+      inner += "<p class='muted'>(no tables found)</p>";
+    }
+    const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+    inner += kafkaPreWithWrapFooter(blob);
+    out.innerHTML = inner;
+    bindCopyButtons(out);
+    const wrap = out.querySelector(".kafka-topic-table-scroll");
+    if (wrap) wireKafkaTableHeaderSort(wrap);
+  }
+
+  document.getElementById("clg-tables-refresh")?.addEventListener("click", async () => {
+    const out = document.getElementById("clg-tables-out");
+    const ks = document.getElementById("clg-tables-ks")?.value?.trim() ?? "";
+    if (!out) return;
+    if (!ks) {
+      out.innerHTML = "<p class='status-bad'>Enter a keyspace name.</p>";
+      return;
+    }
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    try {
+      const j = await loadClgPanel("tables", { keyspace: ks });
+      renderClgTablesOut(j);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  });
+
+  document.getElementById("clg-tables-section")?.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button.js-clg-pick-table");
+    if (!b) return;
+    const encKs = b.getAttribute("data-ks") || "";
+    const encTb = b.getAttribute("data-table") || "";
+    let ks = "";
+    let tb = "";
+    try {
+      ks = decodeURIComponent(encKs);
+      tb = decodeURIComponent(encTb);
+    } catch {
+      ks = "";
+      tb = "";
+    }
+    const nk = document.getElementById("clg-nt-keyspace");
+    const nt = document.getElementById("clg-nt-table");
+    /** Fallback to the keyspace currently used to list tables, so the field is never wiped. */
+    if (!ks) ks = document.getElementById("clg-tables-ks")?.value?.trim() ?? "";
+    if (nk && ks) nk.value = ks;
+    if (nt && tb) nt.value = tb;
+    if (ks && tb) void loadClgNodetoolPanel("tablestats", "clg-nt-tablestats");
+  });
+
+  const clgExecWrap = document.getElementById("clg-exec-out-wrap");
+  const clgExecInner = document.getElementById("clg-exec-out-inner");
+  const clgExecJson = document.getElementById("clg-exec-json");
+  const clgConfBtn = document.getElementById("clg-exec-run-confirmed");
+  /** @type {unknown} */
+  let lastClgExecPayload = null;
+
+  function renderClgExecOut(j) {
+    if (!clgExecInner) return;
+    const asJson = clgExecJson && clgExecJson.checked;
+    const text = asJson ? JSON.stringify(j, null, 2) : formatExecPlainHelper(j);
+    clgExecInner.innerHTML = kafkaPreWithWrapFooter(text);
+    bindCopyButtons(clgExecInner);
+  }
+
+  async function runClgExec(confirmed) {
+    const cql = document.getElementById("clg-exec-cql")?.value?.trim() ?? "";
+    if (!clgExecWrap || !clgExecInner) return;
+    clgExecWrap.hidden = false;
+    clgExecInner.innerHTML = "<p class='muted'>Running…</p>";
+    if (clgConfBtn) clgConfBtn.hidden = true;
+    try {
+      const j = await fetchJson("/api/clingine/exec", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cql, clingine_pod: clgPod(), confirmed }),
+      });
+      lastClgExecPayload = j;
+      if (j.needs_confirmation) {
+        renderClgExecOut(j);
+        if (clgConfBtn) clgConfBtn.hidden = false;
+        return;
+      }
+      renderClgExecOut(j);
+      if (j.ok && cql) {
+        pushRotatingQuery(CLG_HISTORY_KEY, cql);
+        renderClgHistoryUi();
+      }
+    } catch (e) {
+      const payload = e.detail || { error: e.message };
+      lastClgExecPayload = payload;
+      if (e.status === 409 && e.detail && e.detail.needs_confirmation) {
+        renderClgExecOut(e.detail);
+        if (clgConfBtn) clgConfBtn.hidden = false;
+        return;
+      }
+      renderClgExecOut(payload);
+    }
+  }
+
+  clgExecJson?.addEventListener("change", () => {
+    if (lastClgExecPayload != null) renderClgExecOut(lastClgExecPayload);
+  });
+  document.getElementById("clg-exec-run")?.addEventListener("click", () => void runClgExec(false));
+  document.getElementById("clg-exec-run-confirmed")?.addEventListener("click", () => {
+    const ok = window.confirm(
+      "The server flagged this CQL as potentially write-oriented.\n\nRun it anyway? Only proceed if you intend to mutate this Clingine pod's embedded Cassandra data.",
+    );
+    if (ok) void runClgExec(true);
+  });
+  wireWorkloadPodStatus(app, "clingine");
+  wireWorkloadLogs(app, "clingine");
+}
+
 function renderKafka() {
   if (!sessionVerified) {
     app.innerHTML =
@@ -4296,6 +4887,8 @@ function route() {
     renderClickhouse();
   } else if (hashMatchesRoute(h, "#/postgres")) {
     renderPostgres();
+  } else if (hashMatchesRoute(h, "#/clingine")) {
+    renderClingine();
   } else if (hashMatchesRoute(h, "#/cassandra")) {
     renderCassandra();
   } else {

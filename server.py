@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Glassbox STS tool — local web UI for read-only Kafka / ClickHouse / Elasticsearch / PostgreSQL / Cassandra diagnostics via kubectl exec.
+Glassbox STS tool — local web UI for read-only Kafka / ClickHouse / Elasticsearch / PostgreSQL / Clingine / Cassandra diagnostics via kubectl exec.
 
 Run: ./run
 Open: http://127.0.0.1:<port>/
@@ -51,6 +51,7 @@ _LOG_DEFAULT_CONT: dict[str, str] = {
     "opensearch": kx.OPENSEARCH_CONTAINER,
     "postgresql": kx.POSTGRES_CONTAINER,
     "cassandra": kx.CASSANDRA_CONTAINER,
+    "clingine": kx.CLINGINE_CONTAINER,
 }
 
 
@@ -381,7 +382,7 @@ def _workload_logs_stream(
         handler._json(
             {
                 "ok": False,
-                "error": "Missing or invalid workload (use kafka, kafkaconnect, clickhouse, elasticsearch, opensearch, postgresql, cassandra).",
+                "error": "Missing or invalid workload (use kafka, kafkaconnect, clickhouse, elasticsearch, opensearch, postgresql, cassandra, clingine).",
             },
             HTTPStatus.BAD_REQUEST,
         )
@@ -408,18 +409,38 @@ def _workload_logs_stream(
     cl = _cloud_from_session(s)
     ap = _aws_profile_from_session(s)
     env = kx.subprocess_env(ap, cl)
-    argv = [
-        "kubectl",
-        "logs",
-        "-n",
-        ns,
-        pod_name,
-        "-c",
-        container,
-        "--tail",
-        "10",
-        "-f",
-    ]
+    if workload == "clingine":
+        logq = shlex.quote(kx.CLINGINE_LOG_FILE)
+        inner = (
+            f"if [ -f {logq} ]; then tail -n 200 -f {logq}; "
+            f"else echo '[gb_sts] missing {kx.CLINGINE_LOG_FILE}' >&2; tail -f /dev/null; fi"
+        )
+        argv = [
+            "kubectl",
+            "exec",
+            "-n",
+            ns,
+            pod_name,
+            "-c",
+            container,
+            "--",
+            "bash",
+            "-lc",
+            inner,
+        ]
+    else:
+        argv = [
+            "kubectl",
+            "logs",
+            "-n",
+            ns,
+            pod_name,
+            "-c",
+            container,
+            "--tail",
+            "10",
+            "-f",
+        ]
     proc: subprocess.Popen | None = None
     try:
         proc = subprocess.Popen(
@@ -854,6 +875,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "opensearch": kx.OPENSEARCH_CONTAINER,
                     "postgresql": kx.POSTGRES_CONTAINER,
                     "cassandra": kx.CASSANDRA_CONTAINER,
+                    "clingine": kx.CLINGINE_CONTAINER,
                 },
             })
             return
@@ -1125,6 +1147,118 @@ class Handler(SimpleHTTPRequestHandler):
             ap = _aws_profile_from_session(s)
             r = kx.cassandra_nodetool_readonly(
                 ns, pod_name, kx.CASSANDRA_CONTAINER, op, timeout=240, aws_profile=ap, cloud=cl
+            )
+            self._json(
+                {
+                    "ok": r.ok,
+                    "op": op,
+                    "stdout": kx.tail_lines(r.stdout, 25000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                }
+            )
+            return
+
+        if path == "/api/clingine/panel":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+                return
+            panel = (qs.get("panel") or [""])[0].strip()
+            clg_pod = (qs.get("clingine_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("clingine", clg_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid clingine_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            if panel == "keyspaces":
+                cql = pgc.cassandra_keyspaces_cql()
+            elif panel == "desc_keyspace":
+                try:
+                    cql = pgc.cassandra_desc_keyspace_cql((qs.get("keyspace") or [""])[0])
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+            elif panel == "tables":
+                try:
+                    cql = pgc.cassandra_tables_cql((qs.get("keyspace") or [""])[0])
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+            else:
+                self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
+                return
+            r = kx.clingine_cqlsh_via_cassandra_proxy(
+                ns, pod_name, cql, timeout=120, aws_profile=ap, cloud=cl
+            )
+            out_payload: dict = {
+                "ok": r.ok,
+                "panel": panel,
+                "stdout": kx.tail_lines(r.stdout, 8000),
+                "stderr": kx.filter_kubectl_noise(r.stderr),
+                "returncode": r.returncode,
+                "cmd_display": r.cmd_display,
+                "pod": pod_name,
+                "cql_executed": cql,
+                "cql_via": "cqlsh on Cassandra pod (see GB_STS_CLINGINE_CQLSH_PROXY_POD) with CQLSH_HOST=clingine-external-<n> CQLSH_PORT=8186",
+            }
+            if panel == "keyspaces" and r.ok:
+                ks_names = pgc.parse_cassandra_keyspaces_cqlsh_stdout(r.stdout)
+                out_payload["table"] = [["Keyspace name"]] + [[n] for n in ks_names]
+            if panel == "tables" and r.ok:
+                tnames = pgc.parse_cassandra_tables_cqlsh_stdout(r.stdout)
+                out_payload["table"] = [["Table name"]] + [[n] for n in tnames]
+            self._json(out_payload)
+            return
+
+        if path == "/api/clingine/nodetool":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+                return
+            op = (qs.get("op") or [""])[0].strip().lower()
+            clg_pod = (qs.get("clingine_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("clingine", clg_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid clingine_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            nt_bin = (os.environ.get("GB_STS_CLINGINE_NODETOOL") or kx.CLINGINE_NODETOOL_DEFAULT).strip() or kx.CLINGINE_NODETOOL_DEFAULT
+            nt_ks = (qs.get("nt_keyspace") or [""])[0].strip()
+            nt_tb = (qs.get("nt_table") or [""])[0].strip()
+            if op == "tablestats":
+                if not nt_ks or not nt_tb:
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "Clingine tablestats requires nt_keyspace and nt_table (single keyspace.table).",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                try:
+                    pgc.sanitize_cassandra_keyspace(nt_ks)
+                    pgc.sanitize_cassandra_table(nt_tb)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    return
+            r = kx.clingine_nodetool_readonly(
+                ns,
+                pod_name,
+                kx.CLINGINE_CONTAINER,
+                op,
+                timeout=240,
+                aws_profile=ap,
+                cloud=cl,
+                nodetool_bin=nt_bin,
+                tablestats_keyspace=nt_ks if op == "tablestats" else None,
+                tablestats_table=nt_tb if op == "tablestats" else None,
             )
             self._json(
                 {
@@ -1788,6 +1922,54 @@ class Handler(SimpleHTTPRequestHandler):
                     "returncode": r.returncode,
                     "cmd_display": r.cmd_display,
                     "pod": pod_name,
+                }
+            )
+            return
+
+        if path == "/api/clingine/exec":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            cql = str(body.get("cql") or "").strip()
+            confirmed = bool(body.get("confirmed"))
+            ro, reason = pgc.classify_cassandra_cql(cql)
+            if not ro and not confirmed:
+                self._json(
+                    {
+                        "ok": False,
+                        "needs_confirmation": True,
+                        "reason": reason or "non-read-only",
+                        "message": "This CQL may write or mutate data. Submit again with confirmed: true after approval.",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            if not ro and confirmed:
+                low = cql.lower()
+                if any(x in low for x in ("rm -rf", ";--", "bash", "curl ", "wget ", "| sh")):
+                    self._json({"ok": False, "error": "CQL blocked even after confirmation."}, HTTPStatus.FORBIDDEN)
+                    return
+            clg_pod = str(body.get("clingine_pod") or "").strip()
+            pod_name = kx.sanitize_pod_for_workload("clingine", clg_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid clingine_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            r = kx.clingine_cqlsh_via_cassandra_proxy(
+                ns, pod_name, cql, timeout=300, aws_profile=ap, cloud=cl
+            )
+            self._json(
+                {
+                    "ok": r.ok,
+                    "stdout": kx.tail_lines(r.stdout, 12000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                    "cql_via": "cqlsh on Cassandra pod with CQLSH_HOST/CQLSH_PORT to Clingine",
                 }
             )
             return

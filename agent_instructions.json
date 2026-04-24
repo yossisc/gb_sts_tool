@@ -1,6 +1,6 @@
 {
   "document_type": "gb_sts_tool.ai_agent_instructions",
-  "version": 1,
+  "version": 2,
   "must_read_files": ["AI_AGENT_RULES.md", "FUTURE_INSTRUCTIONS.md"],
   "repo": {
     "name": "Glassbox STS Tool",
@@ -28,6 +28,152 @@
     "Bump VERSION in server.py and mirrored cache-bust / footer on every release.",
     "kubectl context must remain visible in the header."
   ],
+  "ui_guide": {
+    "navigation_and_homepage": [
+      "Home is always available at #/ and is the landing page.",
+      "Before session verification succeeds, hide every workload page in the top nav and show only Home.",
+      "After verification succeeds, show all known workload pages in the top nav.",
+      "If a workload exists in routing but stack probe says replicas=0, keep its nav item visible but disabled (gray, non-clickable, aria-disabled). Do not hide it after verification.",
+      "Top-nav state must be derived from cached session + cached stack probe in one pass to avoid flicker or temporary enable/disable races.",
+      "When a user lands on a blocked workload route, keep the current hash and render an in-page callout instead of redirecting to Home.",
+      "Disabled nav items must not navigate when clicked."
+    ],
+    "layout_conventions": [
+      "A page may start with a short muted operational note, then workload Pod status, then subject sections and/or standalone panels.",
+      "Subject sections use titled separators (for example: Brokers, Topics, Groups) and each subject owns its own panel grid or custom layout.",
+      "Unless a page explicitly defines subjects, a DB page may remain a flat page composed of panels in reading order.",
+      "Default panel grids use responsive cards; panels can be normal width, full-width, or page-specific custom spans.",
+      "Supported panel placement semantics for future changes: full page width; 2/3 width aligned left or right; 1/3 width aligned left, center, or right.",
+      "When a page needs non-default proportions, keep them explicit in code/comments rather than relying on accidental CSS behavior."
+    ],
+    "table_and_output_conventions": [
+      "Tables with size/count/lag/bytes/disk-like columns must sort numerically, never alphabetically.",
+      "If a table represents largest/heaviest items, default the initial row order to descending size or descending magnitude.",
+      "Scrollable table wrappers and sortable headers are the standard presentation for dense operational tables.",
+      "Keep outputs readable: prefer structured tables for tabular data and preformatted output for raw command/HTTP results.",
+      "Panel outputs support wrap toggles; exec panels also support JSON view when implemented.",
+      "Avoid long explanatory prose inside data panels when concise status + table(s) communicate the issue better."
+    ],
+    "page_map": {
+      "home": {
+        "purpose": "Connect and verify cluster context before any workload page becomes available.",
+        "sections": [
+          "One connect panel with cloud, region, AWS profile, list clusters, cluster pick/manual cluster name, optional namespace, Connect & verify, Clear session."
+        ],
+        "behavior": [
+          "Restore last successful connection defaults when cloud/region/profile match.",
+          "AWS profile dropdown comes from the backend preset list, while credentials are loaded from ~/.aws/credentials only into child processes.",
+          "Home owns the connect flow; other pages must not try to replace it."
+        ]
+      },
+      "kafka": {
+        "subjects": {
+          "brokers": [
+            "Broker API versions",
+            "Broker default configs (describe)"
+          ],
+          "topics": [
+            "Topic parameter input",
+            "Topics × partition counts",
+            "Topic describe (head)",
+            "Topic end offsets (GetOffsetShell)"
+          ],
+          "groups": [
+            "Custom asymmetric layout: left ~1/3 Consumer groups list, right ~2/3 state/members panels, full-width lag row below"
+          ],
+          "partition_leadership_balance": [
+            "Own subject above Rebalancing Helper",
+            "Rendered as driver cards, not a single monolithic summary",
+            "Drivers currently include Largest topics spread, Partition count spread, RF=1 topics"
+          ]
+        },
+        "standalone_panels": [
+          "Rebalancing Helper (full-width, read-only helper scan)",
+          "Kafka logs",
+          "Custom command (broker shell)"
+        ],
+        "important_rules": [
+          "Kafka Pod status and Kafka replica counting must only include real broker StatefulSet pods matching glassbox-kafka-<n>; exclude lookalikes such as kafka-exporter.",
+          "Partition leadership balance must stay generic for any broker count (1, 2, 3, ...).",
+          "Largest topics spread should be judged cluster-wide and size-weighted, not only by within-replica delta.",
+          "Leadership-balance tables should present largest or most important rows first and stay sortable."
+        ]
+      },
+      "kafka_connect": {
+        "subjects": {
+          "overview": [
+            "Root (worker info)",
+            "Connectors list/status/info/full"
+          ],
+          "connector_details": [
+            "Connector status/config/tasks/topics"
+          ],
+          "infra": [
+            "Connector plugins",
+            "Admin loggers"
+          ]
+        },
+        "standalone_panels": [
+          "Kafka Connect parameters",
+          "Kafka Connect logs"
+        ],
+        "important_rules": [
+          "Connector-specific panels require a connector name and should guide the user when missing.",
+          "Row/JSON filter inputs are part of the panel UX, not a separate page-level feature."
+        ]
+      },
+      "clickhouse": {
+        "structure": "Flat page: parameters panel, diagnostics/data panels grid, custom SQL panel, logs.",
+        "important_rules": [
+          "Parameters toolbar owns pod, time window, event table, tenant UUID, absolute time range, and database explorer inputs.",
+          "Panels are read-first diagnostics; custom SQL exists separately and requires confirmation for writes."
+        ]
+      },
+      "elasticsearch_and_opensearch": {
+        "subjects": {
+          "cluster": [
+            "Version/root, health, nodes, settings, allocation"
+          ],
+          "indices": [
+            "Cat indices and recovery panels with shared filters/index pattern"
+          ],
+          "shards": [
+            "Cat shards, shard stores, shard-level health, named-index shard views"
+          ],
+          "stats": [
+            "Cluster/nodes stats, pending tasks, thread pool, ILM status"
+          ],
+          "others": [
+            "Templates, aliases, metadata slice, nodes info"
+          ]
+        },
+        "standalone_panels": [
+          "Parameters",
+          "Custom GET path",
+          "Logs"
+        ],
+        "important_rules": [
+          "Allocation explain JSON body belongs inside its own panel.",
+          "Indices toolbar and shard toolbar index-pattern inputs stay synchronized.",
+          "Custom path is GET-only and conservatively guarded."
+        ]
+      },
+      "postgresql": {
+        "structure": "Flat page: Pod, Catalog, Tables, Custom SQL, Logs.",
+        "important_rules": [
+          "Catalog and table exploration are fixed read-only queries.",
+          "Custom SQL keeps a last-10 successful history per browser tab."
+        ]
+      },
+      "cassandra": {
+        "structure": "Flat page: Pod, Keyspaces, Describe keyspace, Tables in keyspace, Custom CQL, Logs.",
+        "important_rules": [
+          "Keyspaces panel is the entry point and can feed the keyspace inputs below.",
+          "Custom CQL keeps a last-10 successful history per browser tab."
+        ]
+      }
+    }
+  },
   "http_api": {
     "routes": [
       { "method": "GET", "path": "/api/aws/profiles", "response": "{ ok, profiles[], default_profile, meta{ source: builtin } } — fixed list, does not read ~/.aws" },

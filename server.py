@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 from backend import aws_profiles  # noqa: E402
 from backend import ch_panels as chp  # noqa: E402
@@ -134,7 +134,7 @@ PANEL_CMD_HINT: dict[str, str] = {
     "broker_default_configs": f"{kx.KAFKA_BIN}/kafka-configs.sh --bootstrap-server {kx.BOOTSTRAP} --entity-type brokers --entity-name <id> --describe (per broker id seen in topic metadata)",
     "topics_partition_counts": f"{kx.KAFKA_BIN}/kafka-topics.sh --describe --bootstrap-server {kx.BOOTSTRAP} | grep Topic | awk '{{print $2}}' | sort | uniq -c",
     "leader_balance": f"{kx.KAFKA_BIN}/kafka-topics.sh --describe --bootstrap-server {kx.BOOTSTRAP} (aggregate Leader: counts per broker id)",
-    "consumer_groups_list": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --list; plus --describe --all-groups (truncated) to estimate Group size (MB) from assignment row counts",
+    "consumer_groups_list": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --list; --describe --all-groups; plus du on /bitnami/kafka/data/* to sum on-broker log sizes (MB) for topics assigned to each group",
     "group_state": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --state --verbose",
     "group_members": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --members",
     "group_members_verbose": f"{kx.KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server {kx.BOOTSTRAP} --describe --group <G> --members --verbose",
@@ -632,7 +632,8 @@ class Handler(SimpleHTTPRequestHandler):
         )
         out_stdout = r.stdout or ""
         if es_panel == "es_cat_indices" and r.ok:
-            out_stdout = esp.postprocess_cat_indices(out_stdout, idx_health, idx_state, idx_sub)
+            # Health/state only on the server; index-name substring is applied in the UI on the loaded table.
+            out_stdout = esp.postprocess_cat_indices(out_stdout, idx_health, idx_state, "")
         table: list[list[str]] | None = None
         if r.ok:
             if es_panel == "es_cat_indices":
@@ -640,13 +641,13 @@ class Handler(SimpleHTTPRequestHandler):
             elif es_panel == "es_cat_indices_named":
                 table = esp.table_from_cat_indices_stdout(out_stdout)
             elif es_panel == "es_cat_shards":
-                table = esp.table_from_cat_shards_stdout(out_stdout, shards_sub)
+                table = esp.table_from_cat_shards_stdout(out_stdout, "")
             elif es_panel == "es_cat_shards_named":
-                table = esp.table_from_cat_shards_stdout(out_stdout, shards_sub)
+                table = esp.table_from_cat_shards_stdout(out_stdout, "")
             elif es_panel == "es_cat_recovery":
-                table = esp.table_from_cat_recovery_stdout(out_stdout, idx_sub)
+                table = esp.table_from_cat_recovery_stdout(out_stdout, "")
             elif es_panel == "es_cat_shard_stores":
-                table = esp.table_from_cat_shard_stores_stdout(out_stdout, shards_sub)
+                table = esp.table_from_cat_shard_stores_stdout(out_stdout, "")
         tail_n = 20000 if es_panel in ("es_nodes_stats", "es_cluster_stats") else 12000
         out_payload: dict = {
             "ok": r.ok,
@@ -1042,18 +1043,20 @@ class Handler(SimpleHTTPRequestHandler):
                 r = kx.postgres_psql_query(
                     ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=120, aws_profile=ap, cloud=cl
                 )
-                self._json(
-                    {
-                        "ok": r.ok,
-                        "panel": panel,
-                        "schema": schema,
-                        "stdout": kx.tail_lines(r.stdout, 8000),
-                        "stderr": kx.filter_kubectl_noise(r.stderr),
-                        "returncode": r.returncode,
-                        "cmd_display": r.cmd_display,
-                        "pod": pod_name,
-                    }
-                )
+                out_tbl: dict = {
+                    "ok": r.ok,
+                    "panel": panel,
+                    "schema": schema,
+                    "stdout": kx.tail_lines(r.stdout, 8000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                }
+                if r.ok:
+                    names = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+                    out_tbl["table"] = [["Table"]] + [[n] for n in names[:500]]
+                self._json(out_tbl)
                 return
             self._json({"ok": False, "error": "unknown panel"}, HTTPStatus.BAD_REQUEST)
             return
@@ -1104,6 +1107,76 @@ class Handler(SimpleHTTPRequestHandler):
                 ks_names = pgc.parse_cassandra_keyspaces_cqlsh_stdout(r.stdout)
                 out_payload["table"] = [["Keyspace name"]] + [[n] for n in ks_names]
             self._json(out_payload)
+            return
+
+        if path == "/api/cassandra/nodetool":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified. Connect from Home first."}, HTTPStatus.UNAUTHORIZED)
+                return
+            op = (qs.get("op") or [""])[0].strip().lower()
+            cass_pod = (qs.get("cass_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("cassandra", cass_pod)
+            if not pod_name:
+                self._json({"ok": False, "error": "Invalid cass_pod."}, HTTPStatus.BAD_REQUEST)
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            r = kx.cassandra_nodetool_readonly(
+                ns, pod_name, kx.CASSANDRA_CONTAINER, op, timeout=240, aws_profile=ap, cloud=cl
+            )
+            self._json(
+                {
+                    "ok": r.ok,
+                    "op": op,
+                    "stdout": kx.tail_lines(r.stdout, 25000),
+                    "stderr": kx.filter_kubectl_noise(r.stderr),
+                    "returncode": r.returncode,
+                    "cmd_display": r.cmd_display,
+                    "pod": pod_name,
+                }
+            )
+            return
+
+        if path == "/api/postgres/tenant_hint":
+            s = _session_from(self)
+            if not s:
+                self._json({"ok": False, "error": "Session not verified."}, HTTPStatus.UNAUTHORIZED)
+                return
+            pw = sens.read_postgres_password()
+            if not pw:
+                self._json({"ok": True, "tenant_id": None, "note": "postgres password not configured"})
+                return
+            ns = s["n"]
+            cl = _cloud_from_session(s)
+            ap = _aws_profile_from_session(s)
+            pg_pod_raw = (qs.get("pg_pod") or [""])[0].strip()
+            pod_name = kx.sanitize_pod_for_workload("postgresql", pg_pod_raw) if pg_pod_raw else None
+            if not pod_name:
+                stk = stack.probe_stack_in_namespace(ns, aws_profile=ap, cloud=cl)
+                pods = ((stk.get("components") or {}).get("postgresql") or {}).get("pods") or []
+                if pods:
+                    pod_name = kx.sanitize_pod_for_workload("postgresql", pods[0])
+                if not pod_name:
+                    pod_name = kx.sanitize_pod_for_workload("postgresql", "glassbox-postgresql-0")
+            if not pod_name:
+                self._json({"ok": True, "tenant_id": None, "note": "no postgres pod name resolved"})
+                return
+            sql = pgc.postgres_clarisite_tenant_id_sql()
+            r = kx.postgres_psql_query(
+                ns, pod_name, kx.POSTGRES_CONTAINER, pw, sql, timeout=60, aws_profile=ap, cloud=cl
+            )
+            tid = (r.stdout or "").strip() if r.ok else ""
+            self._json(
+                {
+                    "ok": r.ok,
+                    "tenant_id": tid or None,
+                    "pod": pod_name,
+                    "stderr": kx.filter_kubectl_noise(r.stderr) if r.stderr else "",
+                    "returncode": r.returncode,
+                }
+            )
             return
 
         if path == "/api/kafka/panel":
@@ -1190,16 +1263,45 @@ class Handler(SimpleHTTPRequestHandler):
                 list_body, desc_body = kparse.consumer_groups_list_split_panel_stdout(r.stdout or "")
                 names = kparse.parse_consumer_group_names(list_body)
                 out["groups"] = names
-                counts = kparse.parse_all_groups_describe_row_counts(desc_body)
-                if counts:
-                    rows_tbl: list[list[str]] = []
-                    for n in names:
-                        rc = int(counts.get(n, 0))
-                        mb = (rc * 96.0) / (1024.0 * 1024.0)
-                        rows_tbl.append([n, f"{mb:.4f}"])
-                    out["table"] = [["Group", "Group size (MB)"]] + rows_tbl
+                topic_kb = {}
+                r_du = kx.kafka_bash_exec(
+                    ns,
+                    "du -sk /bitnami/kafka/data/* 2>/dev/null | sort -rn | head -n 600",
+                    timeout=220,
+                    aws_profile=ap,
+                    cloud=cl,
+                )
+                if r_du.ok:
+                    topic_kb = kparse.topic_total_kb_from_du_stdout(r_du.stdout or "")
                 else:
-                    out["table"] = [["Group"]] + [[n] for n in names]
+                    out.setdefault("errors", {})
+                    out["errors"]["consumer_groups_sizes"] = kx.filter_kubectl_noise(r_du.stderr) or "du scan failed"
+                gt = kparse.parse_consumer_group_assigned_topics(desc_body)
+                rows_tbl: list[list[str]] = []
+                for n in names:
+                    topics = gt.get(n) or set()
+                    kb_sum = sum(topic_kb.get(t, 0) for t in topics)
+                    if kb_sum > 0:
+                        mb = kb_sum / 1024.0
+                        rows_tbl.append([n, f"{mb:.2f}"])
+                    elif topic_kb:
+                        rows_tbl.append([n, "0"])
+                    else:
+                        rows_tbl.append([n, "—"])
+
+                def _consumer_group_mb_sort_key(row: list[str]) -> float:
+                    if len(row) < 2:
+                        return float("-inf")
+                    s = (row[1] or "").strip()
+                    if s in ("—", "-", ""):
+                        return float("-inf")
+                    try:
+                        return float(s)
+                    except ValueError:
+                        return float("-inf")
+
+                rows_tbl.sort(key=_consumer_group_mb_sort_key, reverse=True)
+                out["table"] = [["Group", "Topics size (MB)"]] + rows_tbl
             elif panel == "group_lag":
                 lag_rows, lag_hdr = kparse.parse_group_lag_rows(r.stdout, limit=5)
                 if lag_hdr and lag_rows:

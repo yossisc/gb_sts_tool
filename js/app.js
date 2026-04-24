@@ -8,6 +8,7 @@ const footerStatus = document.getElementById("footer-status");
 const footerSession = document.getElementById("footer-session");
 const k8sContextEl = document.getElementById("k8s-context");
 const k8sAwsEl = document.getElementById("k8s-aws");
+const k8sTenantEl = document.getElementById("k8s-tenant");
 const navKafka = document.getElementById("nav-kafka");
 const navKafkaConnect = document.getElementById("nav-kafka-connect");
 const navClickhouse = document.getElementById("nav-clickhouse");
@@ -27,7 +28,7 @@ const WORKLOAD_NAV_STACK_KEYS = [
   [navCassandra, "cassandra"],
 ];
 
-const VERSION = "2.0.1";
+const VERSION = "2.0.2";
 
 /** @type {Record<string, string> | null} */
 let workloadLogContainers = null;
@@ -805,6 +806,49 @@ function renderWorkloadGateCalloutIfBlocked() {
   return false;
 }
 
+/**
+ * @param {string[][] | null | undefined} table
+ * @param {string} needle
+ */
+function filterTableRowsBySubstring(table, needle) {
+  if (!table || !table.length) return table || [];
+  const q = (needle || "").trim().toLowerCase();
+  if (!q) return table;
+  const hdr = table[0];
+  const body = table.slice(1).filter((row) => row.some((cell) => String(cell).toLowerCase().includes(q)));
+  return [hdr, ...body];
+}
+
+/**
+ * @param {HTMLElement | null} outEl
+ * @param {string[][]} fullTable
+ * @param {string} needle
+ * @param {Parameters<typeof renderTable>[1]} renderOpts
+ */
+function replaceTableScrollFromSubstringFilter(outEl, fullTable, needle, renderOpts) {
+  if (!outEl) return;
+  const wrap = outEl.querySelector(".kafka-topic-table-scroll");
+  if (!wrap || !fullTable?.length) return;
+  const filtered = filterTableRowsBySubstring(fullTable, needle);
+  const hub = document.createElement("div");
+  hub.innerHTML = kafkaTopicDataTableScroll(renderTable(filtered, renderOpts));
+  const next = hub.firstElementChild;
+  if (next) {
+    wrap.replaceWith(next);
+    wireKafkaTableHeaderSort(next);
+  }
+}
+
+/**
+ * @param {string[]} lines
+ * @param {string} needle
+ */
+function filterTextLinesBySubstring(lines, needle) {
+  const q = (needle || "").trim().toLowerCase();
+  if (!q) return lines;
+  return lines.filter((ln) => ln.toLowerCase().includes(q));
+}
+
 async function refreshK8sStrip() {
   try {
     const j = await fetchJson("/api/k8s/context");
@@ -818,16 +862,55 @@ async function refreshK8sStrip() {
         if (j.aws_profile) bits.push(`AWS_PROFILE: ${j.aws_profile}`);
         k8sAwsEl.textContent = bits.join(" · ");
       }
+      if (k8sTenantEl) {
+        if (sessionVerified) {
+          try {
+            let pgPod = "";
+            try {
+              const st = JSON.parse(sessionStorage.getItem("gb_sts_stack") || "null");
+              const pods = st?.components?.postgresql?.pods;
+              if (Array.isArray(pods) && pods[0]) pgPod = String(pods[0]);
+            } catch {
+              /* ignore */
+            }
+            const u = new URL("/api/postgres/tenant_hint", location.origin);
+            if (pgPod) u.searchParams.set("pg_pod", pgPod);
+            const t = await fetchJson(u.toString());
+            const tid = t && typeof t === "object" && t.tenant_id ? String(t.tenant_id).trim() : "";
+            if (tid) {
+              k8sTenantEl.hidden = false;
+              k8sTenantEl.textContent = `Tenant: ${tid}`;
+            } else {
+              k8sTenantEl.hidden = true;
+              k8sTenantEl.textContent = "";
+            }
+          } catch {
+            k8sTenantEl.hidden = true;
+            k8sTenantEl.textContent = "";
+          }
+        } else {
+          k8sTenantEl.hidden = true;
+          k8sTenantEl.textContent = "";
+        }
+      }
     } else {
       k8sContextEl.textContent = j.kubectl_stderr || "kubectl error";
       k8sContextEl.classList.add("status-bad");
       k8sContextEl.classList.remove("status-ok");
       if (k8sAwsEl) k8sAwsEl.textContent = "";
+      if (k8sTenantEl) {
+        k8sTenantEl.hidden = true;
+        k8sTenantEl.textContent = "";
+      }
     }
   } catch (e) {
     k8sContextEl.textContent = String(e.message || e);
     k8sContextEl.classList.add("status-bad");
     if (k8sAwsEl) k8sAwsEl.textContent = "";
+    if (k8sTenantEl) {
+      k8sTenantEl.hidden = true;
+      k8sTenantEl.textContent = "";
+    }
   }
 }
 
@@ -874,6 +957,7 @@ async function refreshSessionUi() {
     footerSession.textContent = "Session: unknown · only Home is available until you verify a cluster";
     applyNavState();
   }
+  void refreshK8sStrip();
 }
 
 function setActiveNav() {
@@ -1339,6 +1423,33 @@ async function loadPanel(panelId, elOut, group, topic, fetchOpts = {}) {
       if (wrap) wireKafkaTableHeaderSort(wrap);
     } else if (panelId === "consumer_groups_list") {
       wireKafkaTableHeaderSort(elOut);
+      const tbl = j.table;
+      if (tbl && tbl.length) {
+        elOut._gbStsLastTable = tbl;
+        const hdr = tbl[0];
+        const hasSizeCol = hdr && hdr.length >= 2;
+        elOut._gbStsTableRenderOpts = {
+          theadFirstRow: true,
+          tableClass: "kafka-consumer-groups-table",
+          pickColumn: { index: 0, variant: "group" },
+          stringSortableColumnIndexes: hasSizeCol ? [] : [0],
+          sortableColumnIndexes: hasSizeCol ? [1] : [],
+        };
+      }
+      if (!app.dataset.kafkaGroupsFilterWired) {
+        app.dataset.kafkaGroupsFilterWired = "1";
+        app.addEventListener(
+          "input",
+          /** @param {Event} ev */ (ev) => {
+            const t = ev.target;
+            if (!(t instanceof HTMLInputElement) || t.id !== "kafka-groups-substring-filter") return;
+            const out = document.getElementById("p-groups");
+            const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+            const full = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+            if (out instanceof HTMLElement && opts && full) replaceTableScrollFromSubstringFilter(out, full, t.value, opts);
+          },
+        );
+      }
     }
     return true;
   } catch (e) {
@@ -1841,7 +1952,6 @@ function renderHome() {
       )}</code></p>${pwdHint}${preWithCopy(blob)}`;
       bindCopyButtons(outWrap);
       await refreshSessionUi();
-      await refreshK8sStrip();
     } catch (e) {
       const d = e.detail || { error: e.message };
       outWrap.classList.add("verify-out-wrap--bad");
@@ -1926,14 +2036,19 @@ async function loadChPanel(panelId, elOut, usesEventTable) {
     if (j.table && Array.isArray(j.table) && j.table.length) {
       const cols = Math.max(0, j.table[0].length || 0);
       const strCols = Array.from({ length: cols }, (_, i) => i);
-      inner += kafkaTopicDataTableScroll(
-        renderTable(j.table, {
-          theadFirstRow: true,
-          tableClass: "es-cat-table",
-          sortableColumnIndexes: [],
-          stringSortableColumnIndexes: strCols,
-        }),
-      );
+      const tro = {
+        theadFirstRow: true,
+        tableClass: "es-cat-table",
+        sortableColumnIndexes: [],
+        stringSortableColumnIndexes: strCols,
+      };
+      inner += kafkaTopicDataTableScroll(renderTable(j.table, tro));
+      if (panelId === "ch_explore_tables") {
+        elOut._gbStsLastTable = j.table;
+        elOut._gbStsTableRenderOpts = tro;
+        const fv = document.getElementById("ch-tbl-filter")?.value ?? "";
+        if (fv.trim()) replaceTableScrollFromSubstringFilter(elOut, j.table, fv, tro);
+      }
       const errBlob = j.stderr && String(j.stderr).trim() ? `--- stderr ---\n${stripAnsiSgr(j.stderr)}` : "";
       if (errBlob) inner += kafkaPreWithWrapFooter(errBlob, { preClass: "output-pre--ch-pretty" });
     } else {
@@ -2064,7 +2179,11 @@ function renderClickhouse() {
   let html = "";
   for (const row of chPanels) {
     const [title, , bid] = row;
-    html += panelCard(title, bid);
+    const before =
+      bid === "ch-p-tbl"
+        ? `<div class="panel-toolbar"><label class="field"><span>Filter visible rows</span><input class="text" id="ch-tbl-filter" type="text" maxlength="200" autocomplete="off" placeholder="substring" /></label></div>`
+        : "";
+    html += panelCard(title, bid, { beforeBodyHtml: before });
   }
   grid.innerHTML = html;
   for (const row of chPanels) {
@@ -2072,6 +2191,13 @@ function renderClickhouse() {
     void title;
     wireChPanelRefresh(grid, bid, pid, { usesEventTable, needsTenant });
   }
+  document.getElementById("ch-tbl-filter")?.addEventListener("input", () => {
+    const out = document.getElementById("ch-p-tbl");
+    const full = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+    const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+    const v = document.getElementById("ch-tbl-filter")?.value ?? "";
+    if (out instanceof HTMLElement && full && opts) replaceTableScrollFromSubstringFilter(out, full, v, opts);
+  });
 
   (async () => {
     let stack = null;
@@ -2188,10 +2314,6 @@ function appendSearchEngineToolbarParams(cfg, u) {
   u.searchParams.set(cfg.qsPod, document.getElementById(`${px}-pod-select`)?.value ?? "0");
   u.searchParams.set("idx_health", document.querySelector(`input[name="${px}-idx-health"]:checked`)?.value ?? "all");
   u.searchParams.set("idx_state", document.querySelector(`input[name="${px}-idx-state"]:checked`)?.value ?? "all");
-  const sub = document.getElementById(`${px}-idx-substring`)?.value?.trim() ?? "";
-  if (sub) u.searchParams.set("idx_substring", sub);
-  const shardSub = document.getElementById(`${px}-shards-substring`)?.value?.trim() ?? "";
-  if (shardSub) u.searchParams.set("shards_substring", shardSub);
   const alloc = document.getElementById(`${px}-alloc-body`)?.value ?? "{}";
   u.searchParams.set("alloc_body", alloc);
   const ip = getSearchIndexPatternValue(px);
@@ -2229,36 +2351,53 @@ async function loadSearchEnginePanel(cfg, panelId, elOut) {
         indexPat,
       )}</p>`;
     }
+    let pickIdx =
+      panelId === `${pfx}cat_indices` ||
+      panelId === `${pfx}cat_indices_named` ||
+      panelId === `${pfx}cat_shards` ||
+      panelId === `${pfx}cat_shards_named`
+        ? { index: 0, variant: /** @type {"es_index"} */ ("es_index") }
+        : null;
+    let sortNum =
+      panelId === `${pfx}cat_indices` || panelId === `${pfx}cat_indices_named`
+        ? [3, 4]
+        : panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named`
+          ? [4, 5]
+          : [];
+    let strIdx = panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named` ? [0, 1] : [];
+    const tableRenderOpts = {
+      theadFirstRow: true,
+      tableClass: "es-cat-table",
+      pickColumn: pickIdx || undefined,
+      sortableColumnIndexes: sortNum,
+      stringSortableColumnIndexes: strIdx.length ? strIdx : [],
+    };
     if (j.table && j.table.length) {
-      const pickIdx =
-        panelId === `${pfx}cat_indices` ||
-        panelId === `${pfx}cat_indices_named` ||
-        panelId === `${pfx}cat_shards` ||
-        panelId === `${pfx}cat_shards_named`
-          ? { index: 0, variant: "es_index" }
-          : null;
-      const sortNum =
-        panelId === `${pfx}cat_indices` || panelId === `${pfx}cat_indices_named`
-          ? [3, 4]
-          : panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named`
-            ? [4, 5]
-            : [];
-      const strIdx = panelId === `${pfx}cat_shards` || panelId === `${pfx}cat_shards_named` ? [0, 1] : [];
-      inner += kafkaTopicDataTableScroll(
-        renderTable(j.table, {
-          theadFirstRow: true,
-          tableClass: "es-cat-table",
-          pickColumn: pickIdx || undefined,
-          sortableColumnIndexes: sortNum,
-          stringSortableColumnIndexes: strIdx.length ? strIdx : [],
-        }),
-      );
+      inner += kafkaTopicDataTableScroll(renderTable(j.table, tableRenderOpts));
     }
     const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
     inner += kafkaPreWithWrapFooter(blobOut);
     inner += `<p class='hint'>HTTP via pod ${esc(String(j.pod || ""))}</p>`;
     elOut.innerHTML = inner;
     bindCopyButtons(elOut);
+    if (j.table && j.table.length) {
+      elOut._gbStsLastTable = j.table;
+      elOut._gbStsTableRenderOpts = tableRenderOpts;
+      const idPx = cfg.idPx;
+      const isIdxPanel = elOut.id === `${idPx}-p-idx` || elOut.id === `${idPx}-p-rec`;
+      const isShardPanel = [`${idPx}-p-shards`, `${idPx}-p-sstores`, `${idPx}-p-chs`, `${idPx}-p-shn`].includes(elOut.id);
+      if (isIdxPanel) {
+        const n = document.getElementById(`${idPx}-idx-substring`)?.value ?? "";
+        if (n.trim()) replaceTableScrollFromSubstringFilter(elOut, j.table, n, tableRenderOpts);
+      }
+      if (isShardPanel) {
+        const n = document.getElementById(`${idPx}-shards-substring`)?.value ?? "";
+        if (n.trim()) replaceTableScrollFromSubstringFilter(elOut, j.table, n, tableRenderOpts);
+      }
+    } else {
+      delete elOut._gbStsLastTable;
+      delete elOut._gbStsTableRenderOpts;
+    }
     if (
       [cfg.panelPx + "cat_indices", cfg.panelPx + "cat_indices_named", cfg.panelPx + "cat_shards", cfg.panelPx + "cat_shards_named"].includes(
         panelId,
@@ -2349,7 +2488,7 @@ function renderSearchEnginePage(engineKey) {
       <h2 class="kafka-subject-title" id="${px}-subject-indices">Indices</h2>
       <section class="panel es-indices-toolbar-panel">
         <h3 class="es-subject-toolbar-title">Cat indices — filters</h3>
-        <p class="hint" style="margin-top:0;">Applied to <strong>Cat indices (filtered JSON)</strong> and recovery table row filter. Red rows are unhealthy indices.</p>
+        <p class="hint" style="margin-top:0;">Health/state apply on <strong>Refresh</strong> (server). <strong>Index name contains</strong> filters the loaded Cat indices and recovery tables as you type (no re-fetch). Red rows are unhealthy indices.</p>
         <div class="es-radio-row">
           <span class="es-radio-label">Health:</span>
           <label><input type="radio" name="${px}-idx-health" value="all" checked /> all</label>
@@ -2379,7 +2518,7 @@ function renderSearchEnginePage(engineKey) {
       <h2 class="kafka-subject-title" id="${px}-subject-shards">Shards</h2>
       <section class="panel es-shards-toolbar-panel">
         <h3 class="es-subject-toolbar-title">Shard tables — row filter</h3>
-        <p class="hint">Optional substring match on shard / recovery / shard-store table rows (server-side, case-insensitive).</p>
+        <p class="hint">Filters loaded shard, shard-store, and shard-level health table rows as you type (no re-fetch).</p>
         <label class="field">
           <span>Shard row contains</span>
           <input class="text" id="${px}-shards-substring" type="text" placeholder="substring" maxlength="200" autocomplete="off" />
@@ -2530,6 +2669,33 @@ function renderSearchEnginePage(engineKey) {
   }
 
   wireSearchIndexPatternSync(px);
+
+  (function wireLocalSearchTableFilters(idPx) {
+    const idxInp = document.getElementById(`${idPx}-idx-substring`);
+    const shInp = document.getElementById(`${idPx}-shards-substring`);
+    const applyIdx = () => {
+      const needle = idxInp instanceof HTMLInputElement ? idxInp.value : "";
+      for (const bid of [`${idPx}-p-idx`, `${idPx}-p-rec`]) {
+        const out = document.getElementById(bid);
+        const tbl = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+        const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+        if (!(out instanceof HTMLElement) || !tbl || !tbl.length || !opts) continue;
+        replaceTableScrollFromSubstringFilter(out, tbl, needle, opts);
+      }
+    };
+    const applyShard = () => {
+      const needle = shInp instanceof HTMLInputElement ? shInp.value : "";
+      for (const bid of [`${idPx}-p-shards`, `${idPx}-p-sstores`, `${idPx}-p-chs`, `${idPx}-p-shn`]) {
+        const out = document.getElementById(bid);
+        const tbl = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+        const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+        if (!(out instanceof HTMLElement) || !tbl || !tbl.length || !opts) continue;
+        replaceTableScrollFromSubstringFilter(out, tbl, needle, opts);
+      }
+    };
+    idxInp?.addEventListener("input", applyIdx);
+    shInp?.addEventListener("input", applyShard);
+  })(px);
 
   (async () => {
     let stack = null;
@@ -2695,7 +2861,7 @@ function renderKafkaConnect() {
   ];
 
   function panelFilterInputHtml(panelBodyId) {
-    return `<div class="panel-toolbar"><label class="field"><span>Filter rows / JSON output</span><input class="text" id="${panelBodyId}-filter" type="text" placeholder="substring" maxlength="200" autocomplete="off" /></label></div>`;
+    return `<div class="panel-toolbar"><label class="field"><span>Filter loaded rows / output (as you type)</span><input class="text" id="${panelBodyId}-filter" type="text" placeholder="substring" maxlength="200" autocomplete="off" /></label></div>`;
   }
 
   function fillKcGrid(grid, rows) {
@@ -2729,25 +2895,67 @@ function renderKafkaConnect() {
     }
   }
 
+  /**
+   * @param {HTMLElement} out
+   * @param {Record<string, unknown>} j
+   */
+  function paintKcPanelOut(out, j) {
+    if (!j || j.ok === false) return;
+    const bodyId = out.id;
+    const needle = document.getElementById(`${bodyId}-filter`)?.value ?? "";
+    let inner = "";
+    if (j.cmd_hint) inner += `<p class="panel-cmd-hint panel-cmd-hint--rich">${esc(String(j.cmd_hint))}</p>`;
+    if (j.path_executed) {
+      inner += `<p class="hint ch-sql-hint">${esc(`${String(j.http_method || "GET")} ${String(j.path_executed)}`)}</p>`;
+    }
+    if (j.table && /** @type {unknown[]} */ (j.table).length) {
+      const full = /** @type {string[][]} */ (j.table);
+      const tbl = filterTableRowsBySubstring(full, needle);
+      if (tbl.length > 1) {
+        const cols = Math.max(0, tbl[0].length || 0);
+        const strCols = Array.from({ length: cols }, (_, i) => i);
+        inner += kafkaTopicDataTableScroll(
+          renderTable(tbl, {
+            theadFirstRow: true,
+            tableClass: "es-cat-table",
+            sortableColumnIndexes: [],
+            stringSortableColumnIndexes: strCols,
+          }),
+        );
+      } else if (String(needle).trim()) {
+        inner += "<p class='muted'>No table rows match the filter.</p>";
+      }
+    }
+    const stdoutFiltered = filterTextLinesBySubstring(String(j.stdout || "").split("\n"), needle).join("\n");
+    const blobOut = [stdoutFiltered, j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
+    inner += kafkaPreWithWrapFooter(blobOut);
+    inner += `<p class='hint'>HTTP via pod ${esc(String(j.pod || ""))}</p>`;
+    out.innerHTML = inner;
+    bindCopyButtons(out);
+    const wrap = out.querySelector(".kafka-topic-table-scroll");
+    if (wrap) wireKafkaTableHeaderSort(wrap);
+    decorateKafkaConnectStatus(out);
+  }
+
   async function loadKcPanel(panelId, bodyId, needsConnector) {
     const out = document.getElementById(bodyId);
     if (!out) return;
     const connector = document.getElementById("kc-connector-name")?.value?.trim() ?? "";
     if (needsConnector && !connector) {
+      delete /** @type {{ _kcLastPayload?: unknown }} */ (out)._kcLastPayload;
       out.innerHTML = "<p class='muted'>Enter a <strong>connector name</strong> above, then click <strong>Refresh</strong>.</p>";
       return;
     }
-    const panelFilter = document.getElementById(`${bodyId}-filter`)?.value?.trim() ?? "";
     const kcPod = document.getElementById("kc-pod-select")?.value ?? "0";
     const u = new URL("/api/kafkaconnect/panel", location.origin);
     u.searchParams.set("panel", panelId);
     u.searchParams.set("kc_pod", kcPod);
     if (connector) u.searchParams.set("connector", connector);
-    if (panelFilter) u.searchParams.set("panel_filter", panelFilter);
     out.innerHTML = "<p class='muted'>Loading…</p>";
     try {
       const j = await fetchJson(u.toString());
       if (!j.ok) {
+        delete /** @type {{ _kcLastPayload?: unknown }} */ (out)._kcLastPayload;
         const blob = [j.error || "failed", j.stderr && `stderr:\n${j.stderr}`, j.stdout && `stdout:\n${j.stdout}`]
           .filter(Boolean)
           .join("\n\n");
@@ -2755,30 +2963,10 @@ function renderKafkaConnect() {
         bindCopyButtons(out);
         return;
       }
-      let inner = "";
-      if (j.cmd_hint) inner += `<p class="panel-cmd-hint panel-cmd-hint--rich">${esc(j.cmd_hint)}</p>`;
-      if (j.path_executed) inner += `<p class="hint ch-sql-hint">${esc(`${String(j.http_method || "GET")} ${String(j.path_executed)}`)}</p>`;
-      if (j.table && j.table.length) {
-        const cols = Math.max(0, j.table[0].length || 0);
-        const strCols = Array.from({ length: cols }, (_, i) => i);
-        inner += kafkaTopicDataTableScroll(
-          renderTable(j.table, {
-            theadFirstRow: true,
-            tableClass: "es-cat-table",
-            sortableColumnIndexes: [],
-            stringSortableColumnIndexes: strCols,
-          }),
-        );
-      }
-      const blobOut = [j.stdout || "", j.stderr && `--- stderr ---\n${j.stderr}`].filter(Boolean).join("\n\n");
-      inner += kafkaPreWithWrapFooter(blobOut);
-      inner += `<p class='hint'>HTTP via pod ${esc(String(j.pod || ""))}</p>`;
-      out.innerHTML = inner;
-      bindCopyButtons(out);
-      const wrap = out.querySelector(".kafka-topic-table-scroll");
-      if (wrap) wireKafkaTableHeaderSort(wrap);
-      decorateKafkaConnectStatus(out);
+      out._kcLastPayload = j;
+      paintKcPanelOut(out, j);
     } catch (e) {
+      delete /** @type {{ _kcLastPayload?: unknown }} */ (out)._kcLastPayload;
       out.innerHTML = `<p class='status-bad'>${esc(e.message || "failed")}</p>${kafkaPreWithWrapFooter(
         JSON.stringify(e.detail || {}, null, 2),
       )}`;
@@ -2792,6 +2980,11 @@ function renderKafkaConnect() {
       const btn = grid.querySelector(`[data-refresh="${bodyId}"]`);
       btn?.addEventListener("click", () => {
         void loadKcPanel(panelId, bodyId, needsConnector);
+      });
+      const out = document.getElementById(bodyId);
+      document.getElementById(`${bodyId}-filter`)?.addEventListener("input", () => {
+        const j = out && /** @type {{ _kcLastPayload?: Record<string, unknown> }} */ (out)._kcLastPayload;
+        if (out && j) paintKcPanelOut(out, j);
       });
       void loadKcPanel(panelId, bodyId, needsConnector);
     }
@@ -2910,6 +3103,10 @@ function renderPostgres() {
           <select class="text" id="pg-schema"><option value="">(load schemas first)</option></select>
         </label>
         <button type="button" class="btn btn-primary" id="pg-tables-refresh">List tables</button>
+        <label class="field field--inline">
+          <span>Filter visible rows</span>
+          <input class="text" id="pg-tables-filter" type="text" maxlength="200" autocomplete="off" placeholder="substring" />
+        </label>
       </div>
       <div id="pg-tables-out"><p class="muted">Load schemas, pick one, then click <strong>List tables</strong>.</p></div>
     </section>
@@ -3089,11 +3286,33 @@ function renderPostgres() {
         bindCopyButtons(out);
         return;
       }
-      const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
-      out.innerHTML = `<p class='hint'>pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob, {
-        preClass: "output-pre--pg-tsv",
-      })}`;
-      bindCopyButtons(out);
+      const tro = {
+        theadFirstRow: true,
+        tableClass: "es-cat-table",
+        sortableColumnIndexes: [],
+        stringSortableColumnIndexes: [0],
+      };
+      const table = /** @type {{ table?: string[][] }} */ (j).table;
+      if (Array.isArray(table) && table.length > 1) {
+        let inner = `<p class='hint'>schema <code>${esc(schema)}</code> · pod ${esc(String(j.pod || ""))}</p>`;
+        inner += kafkaTopicDataTableScroll(renderTable(table, tro));
+        out.innerHTML = inner;
+        bindCopyButtons(out);
+        out._gbStsLastTable = table;
+        out._gbStsTableRenderOpts = tro;
+        const fv = document.getElementById("pg-tables-filter")?.value ?? "";
+        if (fv.trim()) replaceTableScrollFromSubstringFilter(out, table, fv, tro);
+        const wrap = out.querySelector(".kafka-topic-table-scroll");
+        if (wrap) wireKafkaTableHeaderSort(wrap);
+      } else {
+        const blob = [j.stdout || "", j.stderr && `stderr:\n${j.stderr}`].filter(Boolean).join("\n\n");
+        out.innerHTML = `<p class='hint'>pod ${esc(String(j.pod || ""))}</p>${kafkaPreWithWrapFooter(blob, {
+          preClass: "output-pre--pg-tsv",
+        })}`;
+        bindCopyButtons(out);
+        delete out._gbStsLastTable;
+        delete out._gbStsTableRenderOpts;
+      }
     } catch (e) {
       const d = e.detail || {};
       out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>${kafkaPreWithWrapFooter(JSON.stringify(d, null, 2))}`;
@@ -3102,6 +3321,13 @@ function renderPostgres() {
   }
 
   document.getElementById("pg-tables-refresh")?.addEventListener("click", () => void loadPgTables());
+  document.getElementById("pg-tables-filter")?.addEventListener("input", () => {
+    const out = document.getElementById("pg-tables-out");
+    const full = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+    const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+    const v = document.getElementById("pg-tables-filter")?.value ?? "";
+    if (out instanceof HTMLElement && full && opts) replaceTableScrollFromSubstringFilter(out, full, v, opts);
+  });
 
   const pgExecWrap = document.getElementById("pg-exec-out-wrap");
   const pgExecInner = document.getElementById("pg-exec-out-inner");
@@ -3209,7 +3435,13 @@ function renderCassandra() {
     <section class="panel" id="cass-keyspaces-panel">
       <h2>Keyspaces</h2>
       <p class="hint" style="margin-top:0;">Runs <code>SELECT keyspace_name FROM system_schema.keyspaces</code> (read-only). Click a keyspace in the table to fill the fields below.</p>
-      <button type="button" class="btn btn-primary" id="cass-keyspaces-refresh">Refresh</button>
+      <div class="panel-toolbar kafka-logs-toolbar">
+        <button type="button" class="btn btn-primary" id="cass-keyspaces-refresh">Refresh</button>
+        <label class="field field--inline">
+          <span>Filter visible rows</span>
+          <input class="text" id="cass-keyspaces-filter" type="text" maxlength="200" autocomplete="off" placeholder="substring" />
+        </label>
+      </div>
       <div id="cass-keyspaces-out" style="margin-top:0.75rem;"><p class="muted">Loading…</p></div>
     </section>
     <section class="panel">
@@ -3246,6 +3478,13 @@ function renderCassandra() {
           <label class="exec-json-chk"><input type="checkbox" id="cass-exec-json" /> json</label>
         </div>
       </div>
+    </section>
+    <section class="kafka-subject" aria-labelledby="cass-subject-nt">
+      <h2 class="kafka-subject-title" id="cass-subject-nt">Nodetool (read-only)</h2>
+      <p class="muted" style="margin-top:0;">
+        Runs <code>/opt/bitnami/cassandra/bin/nodetool -h localhost …</code> inside the pod (override with server env <code>GB_STS_NODETOOL</code>). Large outputs are truncated server-side. Use each panel’s substring box to filter visible lines without re-running.
+      </p>
+      <div class="panels-grid" id="cass-nt-grid"></div>
     </section>
     ${workloadLogsPanelHtml("cassandra", "Cassandra logs")}
   `;
@@ -3342,6 +3581,8 @@ function renderCassandra() {
     if (!out) return;
     if (!j || typeof j !== "object" || !j.ok) {
       const err = /** @type {{ error?: string, stderr?: string, stdout?: string }} */ (j || {});
+      delete out._gbStsLastTable;
+      delete out._gbStsTableRenderOpts;
       out.innerHTML = `<p class="status-bad">${esc(err.error || err.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
         [err.stdout, err.stderr].filter(Boolean).join("\n"),
       )}`;
@@ -3350,15 +3591,14 @@ function renderCassandra() {
     }
     let inner = `<p class='hint'>${esc(String(/** @type {{ cql_executed?: string }} */ (j).cql_executed || ""))}</p>`;
     const table = /** @type {{ table?: string[][] }} */ (j).table;
+    const tro = {
+      theadFirstRow: true,
+      tableClass: "es-cat-table",
+      pickColumn: { index: 0, variant: /** @type {"cassandra_keyspace"} */ ("cassandra_keyspace") },
+      stringSortableColumnIndexes: [0],
+    };
     if (Array.isArray(table) && table.length > 1) {
-      inner += kafkaTopicDataTableScroll(
-        renderTable(table, {
-          theadFirstRow: true,
-          tableClass: "es-cat-table",
-          pickColumn: { index: 0, variant: "cassandra_keyspace" },
-          stringSortableColumnIndexes: [0],
-        }),
-      );
+      inner += kafkaTopicDataTableScroll(renderTable(table, tro));
     } else if (Array.isArray(table) && table.length === 1) {
       inner += "<p class='muted'>(no keyspaces found)</p>";
     }
@@ -3366,6 +3606,15 @@ function renderCassandra() {
     inner += kafkaPreWithWrapFooter(blob);
     out.innerHTML = inner;
     bindCopyButtons(out);
+    if (Array.isArray(table) && table.length > 1) {
+      out._gbStsLastTable = table;
+      out._gbStsTableRenderOpts = tro;
+      const fv = document.getElementById("cass-keyspaces-filter")?.value ?? "";
+      if (fv.trim()) replaceTableScrollFromSubstringFilter(out, table, fv, tro);
+    } else {
+      delete out._gbStsLastTable;
+      delete out._gbStsTableRenderOpts;
+    }
     const wrap = out.querySelector(".kafka-topic-table-scroll");
     if (wrap) wireKafkaTableHeaderSort(wrap);
   }
@@ -3383,6 +3632,89 @@ function renderCassandra() {
   }
 
   document.getElementById("cass-keyspaces-refresh")?.addEventListener("click", () => void refreshCassKeyspaces());
+  document.getElementById("cass-keyspaces-filter")?.addEventListener("input", () => {
+    const out = document.getElementById("cass-keyspaces-out");
+    const full = out && /** @type {{ _gbStsLastTable?: string[][] }} */ (out)._gbStsLastTable;
+    const opts = out && /** @type {{ _gbStsTableRenderOpts?: Parameters<typeof renderTable>[1] }} */ (out)._gbStsTableRenderOpts;
+    const v = document.getElementById("cass-keyspaces-filter")?.value ?? "";
+    if (out instanceof HTMLElement && full && opts) replaceTableScrollFromSubstringFilter(out, full, v, opts);
+  });
+
+  async function loadCassNodetoolPanel(op, bodyId) {
+    const out = document.getElementById(bodyId);
+    if (!out) return;
+    out.innerHTML = "<p class='muted'>Loading…</p>";
+    const u = new URL("/api/cassandra/nodetool", location.origin);
+    u.searchParams.set("op", op);
+    u.searchParams.set("cass_pod", cassPod());
+    try {
+      const j = await fetchJson(u.toString());
+      if (!j.ok) {
+        out.innerHTML = `<p class='status-bad'>${esc(j.error || j.stderr || "failed")}</p>${kafkaPreWithWrapFooter(
+          [j.stdout, j.stderr].filter(Boolean).join("\n"),
+        )}`;
+        bindCopyButtons(out);
+        delete /** @type {{ _cassNtBundle?: unknown }} */ (out)._cassNtBundle;
+        return;
+      }
+      const lines = String(j.stdout || "").split("\n");
+      out._cassNtBundle = {
+        stdoutLines: lines,
+        stderr: j.stderr,
+        returncode: j.returncode,
+        pod: j.pod,
+      };
+      paintCassNodetoolPanel(bodyId);
+    } catch (e) {
+      out.innerHTML = `<p class='status-bad'>${esc(e.message)}</p>`;
+    }
+  }
+
+  function paintCassNodetoolPanel(bodyId) {
+    const out = document.getElementById(bodyId);
+    const b =
+      out &&
+      /** @type {{ _cassNtBundle?: { stdoutLines: string[]; stderr?: string; returncode?: number; pod?: string } }} */ (out)._cassNtBundle;
+    if (!(out instanceof HTMLElement) || !b || !Array.isArray(b.stdoutLines)) return;
+    const sub = document.getElementById(`${bodyId}-subf`);
+    const needle = sub instanceof HTMLInputElement ? sub.value : "";
+    const shown = filterTextLinesBySubstring(b.stdoutLines, needle);
+    let html = kafkaPreWithWrapFooter(shown.join("\n"));
+    if (b.stderr && String(b.stderr).trim()) html += kafkaPreWithWrapFooter(`--- stderr ---\n${b.stderr}`);
+    html += `<p class='hint'>exit ${esc(String(b.returncode ?? ""))} · pod ${esc(String(b.pod || ""))}</p>`;
+    out.innerHTML = html;
+    bindCopyButtons(out);
+  }
+
+  const ntOps = [
+    ["Cluster status", "status"],
+    ["Table stats", "tablestats"],
+    ["Thread pool stats", "tpstats"],
+    ["GC stats", "gcstats"],
+    ["Compaction stats", "compactionstats"],
+    ["Proxy histograms", "proxyhistograms"],
+  ];
+  const ntGrid = document.getElementById("cass-nt-grid");
+  if (ntGrid) {
+    let nth = "";
+    for (const [label, op] of ntOps) {
+      const bid = `cass-nt-${op}`;
+      nth += panelCard(`${label} (<code>nodetool ${esc(op)}</code>)`, bid, {
+        beforeBodyHtml: `<div class="panel-toolbar"><label class="field"><span>substring</span><input class="text" id="${esc(bid)}-subf" maxlength="200" autocomplete="off" placeholder="filter lines" /></label></div>`,
+      });
+    }
+    ntGrid.innerHTML = nth;
+    for (const [, op] of ntOps) {
+      const bid = `cass-nt-${op}`;
+      ntGrid.querySelector(`[data-refresh="${bid}"]`)?.addEventListener("click", () => void loadCassNodetoolPanel(op, bid));
+      document.getElementById(`${bid}-subf`)?.addEventListener("input", () => void paintCassNodetoolPanel(bid));
+      void loadCassNodetoolPanel(op, bid);
+    }
+    document.getElementById("cass-pod-select")?.addEventListener("change", () => {
+      void refreshCassKeyspaces();
+      for (const [, op] of ntOps) void loadCassNodetoolPanel(op, `cass-nt-${op}`);
+    });
+  }
 
   document.getElementById("cass-keyspaces-panel")?.addEventListener("click", (ev) => {
     const b = ev.target.closest("button.js-cass-pick-keyspace");
@@ -3663,6 +3995,9 @@ function renderKafka() {
         extraPanelClass: typeof extraCls === "string" ? extraCls : "",
       };
       if (panelOpts === "activate") cardOpts.actionButtonText = "Activate";
+      if (bid === "p-groups") {
+        cardOpts.beforeBodyHtml = `<div class="panel-toolbar"><label class="field"><span>Filter visible rows</span><input type="text" class="text" id="kafka-groups-substring-filter" maxlength="200" autocomplete="off" placeholder="substring" /></label></div>`;
+      }
       leftHtml += panelCard(title, bid, cardOpts);
     }
     let rightHtml = "";

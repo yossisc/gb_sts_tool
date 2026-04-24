@@ -115,8 +115,9 @@ def postprocess_cat_indices(stdout: str, health: str, state: str, substring: str
         return stdout
     filtered = filter_cat_indices_rows(data, health=health, state=state, substring=substring)
     note = (
-        f"# filtered rows: {len(filtered)} (health={health or 'all'}, state={state or 'all'}, "
-        f"substring={substring or '(none)'})\n"
+        f"# filtered rows: {len(filtered)} (health={health or 'all'}, state={state or 'all'}"
+        + (f", substring={substring}" if substring else ", index name substring: UI filters loaded table)")
+        + ")\n"
     )
     return note + json.dumps(filtered, indent=2, default=str)
 

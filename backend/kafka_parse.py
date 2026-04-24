@@ -49,6 +49,49 @@ def parse_consumer_group_names(stdout: str) -> list[str]:
     return sorted(set(names), key=lambda s: s.casefold())
 
 
+def parse_consumer_group_assigned_topics(stdout: str) -> dict[str, set[str]]:
+    """
+    From ``kafka-consumer-groups.sh --describe --all-groups`` assignment/lag lines
+    (GROUP TOPIC PARTITION ...), collect distinct topic names per consumer group.
+    """
+    topics: dict[str, set[str]] = {}
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 9:
+            continue
+        if parts[0].upper() == "GROUP" and parts[1].upper() == "TOPIC":
+            continue
+        g, topic = parts[0], parts[1]
+        if not parts[2].isdigit():
+            continue
+        try:
+            int(parts[5])
+        except (ValueError, IndexError):
+            continue
+        topics.setdefault(g, set()).add(topic)
+    return topics
+
+
+def topic_total_kb_from_du_stdout(stdout: str) -> dict[str, int]:
+    """
+    Sum ``du -sk`` kilobytes per Kafka log directory topic (same basis as
+    ``aggregate_du_kafka_data_by_topic`` / leadership balance).
+    """
+    per_part = parse_du_kafka_data_dirs(stdout)
+    totals: dict[str, int] = {}
+    for row in per_part[1:]:
+        if len(row) < 3:
+            continue
+        topic, sk = row[0], row[2]
+        if not str(sk).isdigit():
+            continue
+        totals[topic] = totals.get(topic, 0) + int(sk)
+    return totals
+
+
 def parse_all_groups_describe_row_counts(stdout: str) -> dict[str, int]:
     """
     Parse ``kafka-consumer-groups.sh --describe --all-groups`` table lines

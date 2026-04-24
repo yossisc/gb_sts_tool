@@ -668,6 +668,47 @@ def postgres_psql_query(
     return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
 
 
+def cassandra_nodetool_readonly(
+    namespace: str,
+    pod_name: str,
+    container: str,
+    op: str,
+    *,
+    timeout: int = 220,
+    aws_profile: str | None = None,
+    cloud: str | None = None,
+) -> CmdResult:
+    """
+    Run a fixed read-only ``nodetool`` subcommand inside the Cassandra pod (no JMX mutations).
+
+    Override binary with env ``GB_STS_NODETOOL`` (absolute path on the pod).
+    """
+    allowed: dict[str, tuple[str, int]] = {
+        "status": ("status", 800),
+        "tablestats": ("tablestats", 15000),
+        "tpstats": ("tpstats", 5000),
+        "gcstats": ("gcstats", 400),
+        "compactionstats": ("compactionstats", 1200),
+        "proxyhistograms": ("proxyhistograms", 5000),
+    }
+    key = (op or "").strip().lower()
+    if key not in allowed:
+        return CmdResult(
+            ok=False,
+            stdout="",
+            stderr=f"unknown nodetool op (allowed: {', '.join(sorted(allowed))})",
+            returncode=2,
+            cmd_display="(rejected)",
+        )
+    sub, cap = allowed[key]
+    nt_default = "/opt/bitnami/cassandra/bin/nodetool"
+    nt_path = os.environ.get("GB_STS_NODETOOL", nt_default).strip() or nt_default
+    ntq = shlex.quote(nt_path)
+    inner = f"if [ ! -x {ntq} ]; then echo 'nodetool not found (set GB_STS_NODETOOL to the in-pod path)' >&2; exit 127; fi; "
+    inner += f"{ntq} -h localhost {sub} 2>&1 | head -n {cap}"
+    return pod_bash_lc_exec(namespace, pod_name, container, inner, timeout=timeout, aws_profile=aws_profile, cloud=cloud)
+
+
 def cassandra_cqlsh_query(
     namespace: str,
     pod_name: str,

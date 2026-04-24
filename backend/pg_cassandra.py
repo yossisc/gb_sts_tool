@@ -55,6 +55,11 @@ def classify_postgres_sql(sql: str) -> tuple[bool, str]:
     return False, "only SELECT / SHOW / EXPLAIN / TABLE are auto-approved"
 
 
+def postgres_clarisite_tenant_id_sql() -> str:
+    """Read-only sample tenant id (Glassbox management schema)."""
+    return "SELECT tenant_id::text FROM clarisite_management.users LIMIT 1"
+
+
 def postgres_tables_sql(schema: str) -> str:
     """List tables in a fixed schema (read-only)."""
     s = sanitize_postgres_schema(schema)
